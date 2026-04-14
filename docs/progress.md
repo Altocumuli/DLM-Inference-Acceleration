@@ -407,11 +407,24 @@
 
 ---
 
-### 2026-03-25
+### 2026-03-26
 
-### 2026-03-26（文件恢复）
+43. **文件恢复**
+    - `dlm/docs/` 下 `thesis_draft.md`、`make_charts.py` 及若干 `*.md`，以及 `dlm/src/` 下全部 `*.py` 曾一度缺失（`__pycache__` 仍在）。
+    - 已从 **Cursor/VS Code 远端本地历史** 路径 `~/.cursor-server/data/User/History/` 中按各文件 **entries.json 里时间戳最新的快照** 拷回工程目录；`README.md` 同步恢复。
+    - **说明**：`llada2_chat_prompt.py` 按此前文档已弃用，无 History 条目；当前 `run_benchmark_llada2.py` 等已统一 `apply_chat_template`，不依赖该文件。
+    - **建议**：尽快 `git init` + 提交，或定期备份 `dlm/`，避免再次丢失。
 
-- `dlm/docs/` 下 `thesis_draft.md`、`make_charts.py` 及若干 `*.md`，以及 `dlm/src/` 下全部 `*.py` 曾一度缺失（`__pycache__` 仍在）。
-- 已从 **Cursor/VS Code 远端本地历史** 路径 `~/.cursor-server/data/User/History/` 中按各文件 **entries.json 里时间戳最新的快照** 拷回工程目录；`README.md` 同步恢复。
-- **说明**：`llada2_chat_prompt.py` 按此前文档已弃用，无 History 条目；当前 `run_benchmark_llada2.py` 等已统一 `apply_chat_template`，不依赖该文件。
-- **建议**：尽快 `git init` + 提交，或定期备份 `dlm/`，避免再次丢失。
+---
+
+### 2026-04-07
+
+44. **CLAD v3 实现（O3 批量 Phase-2 forward + O4 级联草稿）**
+    - **代码**：新增 `dlm/src/llada_clad_v3_decode.py`，入口 `generate_with_clad_v3`，配置 `CladV3Config`。
+    - **O1 / O2**：与 v2 设计对齐——`_clad_branch_score_v2`（α·加权一致性 + β·熵降 + future_conf）、`_apply_o2_second_token`（胜者 logits 上二次高置信接受，`accept_threshold2=0.90`）。
+    - **O3**：Phase-2 将多条候选 `branch_x` 拼 batch，`attention_mask` / `position_ids` 按 batch 维 expand，`_llada_forward_logits_batched` 一次前向；`use_batched_phase2=False` 时可回退串行 forward（便于排错或与旧行为对照）。
+    - **O4**：`use_cascaded_draft=True`（默认）时 Level-1 仅取置信度 top-2 位置构造 **B=2** 分支并一次 batch；选最优后复用该行 logits 做 O2。`False` 时改为 flat top-`k`（`k=num_lookahead`）批量比较 + O2。
+    - **接入评测**：`run_benchmark_llada2.py` 增加 `--decode_mode clad_v3` 与 `_run_clad_v3_generate`；`clad_v2` 的 `CladV2Config` 调用已与当前 `llada_clad_v2_decode.CladConfig` 字段对齐（去掉不存在的 `entropy_weight` / `accept_threshold2` 形参，避免实例化报错）。
+    - **文档**：`design.md` 新增 **§1.11 CLAD-v3**；本节 `progress.md` 留档。
+
+

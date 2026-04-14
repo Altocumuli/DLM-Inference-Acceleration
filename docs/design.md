@@ -394,15 +394,15 @@ CladV2Config(
 
 ### 1.10.5 五种策略完整对比
 
-| 维度 | Baseline | LoPA | CCD | CLAD v1 | **CLAD v2** |
-|------|----------|------|-----|---------|------------|
-| 核心机制 | 置信度阈值 | 多分支前瞻 | 双步一致性 | 一致性引导前瞻 | **信息密度加权 + 多 token 接受** |
-| 步数控制 | 固定 | 固定 | 自适应 | 自适应 | **自适应** |
-| 前向计算/步 | 1 次 | (k+1) 次 | 1 次 | 1 或 (k+1) 次 | **1 或 (k+1) 次** |
-| 每次 Phase-2 接受 token 数 | — | 1 | — | 1 | **1～2（按置信度）** |
-| 一致性评分权重 | — | — | — | 均匀 | **高熵位置加权** |
-| 信息量利用 | 无 | 无 | 无 | 无 | **熵下降奖励** |
-| 预期 TPF | 基准 | 中 | 高 | 高 | **更高** |
+| 维度 | Baseline | LoPA | CCD | CLAD v1 | CLAD v2 | **CLAD v3** |
+|------|----------|------|-----|---------|---------|------------|
+| 核心机制 | 置信度阈值 | 多分支前瞻 | 双步一致性 | 一致性引导前瞻 | 信息密度加权 + 多 token 接受 | **v2 + Phase-2 batch forward + 级联 top-2 L1** |
+| 步数控制 | 固定 | 固定 | 自适应 | 自适应 | 自适应 | **自适应** |
+| 前向计算/步 | 1 次 | (k+1) 次 | 1 次 | 1 或 (k+1) 次 | 1 或 (k+1) 次 | **Phase-2 常为 1 次 batched（+ 主步 1 次）** |
+| 每次 Phase-2 接受 token 数 | — | 1 | — | 1 | 1～2 | **1～2（同 v2）** |
+| 一致性评分权重 | — | — | — | 均匀 | 高熵位置加权 | **同 v2** |
+| Phase-2 分支计算 | — | 串行多前向 | — | 串行多前向 | 串行多前向 | **默认批量 1 次前向（O3）** |
+| 预期 TPF | 基准 | 中 | 高 | 高 | 更高 | **在 v2 基础上降低 Phase-2 前向次数** |
 
 ### 1.10.6 配置与使用
 
@@ -419,6 +419,7 @@ python dlm/src/run_benchmark_llada2.py --benchmark arc_challenge --decode_mode l
 python dlm/src/run_benchmark_llada2.py --benchmark arc_challenge --decode_mode ccd
 python dlm/src/run_benchmark_llada2.py --benchmark arc_challenge --decode_mode clad
 python dlm/src/run_benchmark_llada2.py --benchmark arc_challenge --decode_mode clad_v2
+python dlm/src/run_benchmark_llada2.py --benchmark arc_challenge --decode_mode clad_v3
 ```
 
 ### 1.10.7 备注：一致性通道的阈值门控（中期后候选实验）
@@ -438,6 +439,66 @@ python dlm/src/run_benchmark_llada2.py --benchmark arc_challenge --decode_mode c
 - 当启用时，一致性候选需同时满足 `cur_prob >= consistency_min_conf` 才接受
 
 建议消融网格：`None / 0.5 / 0.6 / 0.7 / 0.8`，并同时报告 Accuracy、Throughput、TPF、Diffusion Steps，评估“质量-速度”折中。
+
+---
+
+## 1.11 CLAD-v3——O3 分支批量 forward + O4 级联草稿
+
+**实现文件**：`dlm/src/llada_clad_v3_decode.py`  
+**运行**：`python dlm/src/run_benchmark_llada2.py --decode_mode clad_v3`
+
+在 **CLAD v2 的 O1（信息密度加权分支评分）与 O2（同一分支 logits 上二次高置信接受）** 保持不变的前提下，v3 针对 Phase-2 的 **GPU 利用率** 与 **草稿深度** 做两步扩展。
+
+### 1.11.1 O3｜Phase-2 分支批量化 forward
+
+**动机**：Spiffy、LoPA 原论文均指出，在块因果结构下，多个仅在某 mask 位置不同的候选序列可视为 batch 维上的独立样本，用一次矩阵乘并行算出各分支 logits，比串行 `k` 次 forward 更利于 GPU 吞吐。
+
+**做法**：将 `k` 条 `branch_x`（均为 `[1, window_end]`）沿 batch 维拼为 `input_ids`，形状 `[B, L]`；将全局块注意力子矩阵 `cur_attn_mask` `[1,1,L,L]` 沿 batch 维 `expand(B,1,L,L)`，`position_ids` 同理扩展为 `[B,L]`，调用与 v2 相同的 `model.model` + `lm_head` 路径 **`_llada_forward_logits_batched`**，**`forward_count` 仅 +1**。
+
+**开关**：`CladV3Config.use_batched_phase2=True`（默认）。若在某环境出现与 batch 相关的兼容性错误，可置 `False` 退化为逐分支前向（与旧版等价，仅慢）。
+
+### 1.11.2 O4｜级联草稿前瞻（Spiffy-inspired，与 O3 合用）
+
+**动机**：在「一次 Phase-2 前向」内不仅比较「单点填入」的优劣，还希望利用 **胜者分支上的分布** 再决定是否多接受一个 token（与 O2 思想一致，但 L1 侧只比较 **top-2 置信位置** 两条分支，结构更清晰）。
+
+**默认行为**（`use_cascaded_draft=True`）：
+
+1. **Level-1**：在当前仍为 mask 的位置中，按当前步最大概率取 **前 2 个位置** `p1, p2`，构造两条仅在该点填入 argmax 的分支；**一次 batched forward（B=2）** 得到 `logits[0]`, `logits[1]`。
+2. **评分**：对两行分别用 **O1 综合分** `_clad_branch_score_v2`（与 v2 公式一致：加权一致性 + 熵降 + future_conf）比较，取最优行对应的填入位置与 token，写回序列。
+3. **Level-2 / O2**：**不新增 forward**，直接使用 **胜者行** 在块内的 logits，对剩余 mask 位置取最大置信度；若 ≥ `accept_threshold2`（默认 0.90），再写入第二个 token。
+
+**关闭 O4 时**（`use_cascaded_draft=False`）：Level-1 改为取 `num_lookahead` 个 top 位置，构造 `B=k` 条分支，一次 batch forward 后同样用 O1 选优，再接 O2。适用于希望与「flat top-k」更接近的对照实验。
+
+### 1.11.3 与 v2 的差异小结
+
+| 维度 | CLAD v2 | CLAD v3 |
+|------|---------|---------|
+| O1 / O2 | ✅ 同左 | ✅ 同左（同一套 `_clad_branch_score_v2` + `_apply_o2_second_token`） |
+| Phase-2 前向 | 多分支时多为 **串行 k 次** | 默认 **1 次 batched**（O3） |
+| L1 候选结构 | top-`k` 各一分支 | 默认 **top-2** 级联叙事（O4），可关 |
+| 逻辑等价性 | — | 在「分支独立、评分公式不变」前提下与串行等价；数值应一致或仅浮点差异 |
+
+### 1.11.4 配置示例
+
+```python
+# llada_clad_v3_decode.CladV3Config（节选）
+CladV3Config(
+    top_v=4,
+    num_lookahead=2,
+    consistency_weight=0.5,
+    entropy_weight=0.2,
+    lookahead_warmup=3,
+    accept_threshold2=0.90,
+    use_batched_phase2=True,   # O3
+    use_cascaded_draft=True,    # O4（False 则 flat top-k batch）
+    vocab_size=156896,
+    # 其余 gen_length / block_length / threshold 等与 v1/v2 对齐
+)
+```
+
+```bash
+python dlm/src/run_benchmark_llada2.py --benchmark gsm8k_small --decode_mode clad_v3 --max_examples 50
+```
 
 ---
 
@@ -493,7 +554,7 @@ python dlm/src/run_benchmark_llada2.py --benchmark arc_challenge --decode_mode c
 **命令行接口**：
 - `--benchmark`：选择单个数据集（`gsm8k_small` / `aime2025_all` / `humaneval_all` / `mbpp_sanitized` / `arc_easy` / `arc_challenge`）
 - `--benchmarks`：选择多个数据集（**推荐**，模型只加载一次）
-- `--decode_mode`：解码策略（`baseline` / `lopa` / `ccd` / `clad`，默认 `baseline`）
+- `--decode_mode`：解码策略（`baseline` / `lopa` / `ccd` / `clad` / `clad_v2` / `clad_v3`，默认 `baseline`）
 - `--max_examples`：可选，限制最多跑多少条样本
 
 **评测脚本**：`dlm/src/evaluate_benchmark_results.py`

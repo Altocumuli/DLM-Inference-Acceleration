@@ -30,6 +30,10 @@ from llada_clad_decode import generate_with_clad, CladConfig
 from llada_clad_v2_decode import generate_with_clad as generate_with_clad_v2
 from llada_clad_v2_decode import CladConfig as CladV2Config
 
+# CLAD-v3（O1/O2 + O3 批量 Phase-2 forward + O4 级联草稿）
+from llada_clad_v3_decode import generate_with_clad_v3
+from llada_clad_v3_decode import CladV3Config
+
 
 """
 用 LLaDA2.1-mini 在本地 benchmarks 上跑不同的解码策略，并记录解码效率指标。
@@ -40,6 +44,7 @@ from llada_clad_v2_decode import CladConfig as CladV2Config
 - ccd: 基于 CCD (Coherent and Consistent Decoding) 的双步一致性加速策略
 - clad: CLAD v1（Consistency-guided Lookahead Adaptive Decoding），毕设原创策略
 - clad_v2: CLAD v2，在 v1 基础上引入信息密度加权一致性评分（O1）和多 token 自适应接受（O2）
+- clad_v3: CLAD v3，在 v2 基础上增加 Phase-2 分支批量 forward（O3）与级联草稿前瞻（O4）
 
 当前支持的 benchmark 文件（均为 jsonl，一行一个样本）：
 - math:
@@ -246,7 +251,8 @@ def run_generate_single(
     - lopa: 基于 LoPA (Lookahead Parallel Decoding) 的多分支解码策略
     - ccd: 基于 CCD (Coherent and Consistent Decoding) 的双步一致性加速策略
     - clad: CLAD v1（Consistency-guided Lookahead Adaptive Decoding），毕设原创策略
-    - clad_v2: CLAD v2，信息密度加权一致性评分（O1）+ 多 token 自适应接受（O2）
+    - clad_v2: CLAD v2（与 v1 同实现入口时可切换权重）
+    - clad_v3: CLAD v3，O1/O2 + Phase-2 批量 forward（O3）+ 级联草稿（O4）
 
     gen_length：生成区最大 token 数（不含 prompt），默认 2048。
 
@@ -274,10 +280,14 @@ def run_generate_single(
         return _run_clad_v2_generate(
             actual_model, tokenizer, prompt, gen_length=gen_length
         )
+    if decode_mode == "clad_v3":
+        return _run_clad_v3_generate(
+            actual_model, tokenizer, prompt, gen_length=gen_length
+        )
     else:
         raise ValueError(
             f"Unsupported decode_mode: {decode_mode}. "
-            f"Supported modes: ['baseline', 'lopa', 'ccd', 'clad', 'clad_v2']"
+            f"Supported modes: ['baseline', 'lopa', 'ccd', 'clad', 'clad_v2', 'clad_v3']"
         )
 
 
@@ -411,13 +421,12 @@ def _run_clad_v2_generate(
     model, tokenizer, prompt: str, gen_length: int = 2048
 ) -> Tuple[str, int]:
     """CLAD-v2：信息密度加权一致性评分（O1）+ 多 token 自适应接受（O2）"""
+    # 与 llada_clad_v2_decode.CladConfig 字段一致（完整 O1/O2 见 clad_v3）
     clad_v2_config = CladV2Config(
         top_v=4,
         num_lookahead=2,
-        consistency_weight=0.5,  # α（加权一致率）
-        entropy_weight=0.2,  # β（熵下降奖励）；future_conf = 1-α-β = 0.3
+        consistency_weight=0.6,
         lookahead_warmup=3,
-        accept_threshold2=0.90,  # O2：第 2 个 token 接受所需最低置信度
         gen_length=gen_length,
         block_length=32,
         threshold=0.7,
@@ -430,6 +439,32 @@ def _run_clad_v2_generate(
     )
     text, n_fw = generate_with_clad_v2(model, tokenizer, prompt, clad_v2_config)
     return text, n_fw
+
+
+def _run_clad_v3_generate(
+    model, tokenizer, prompt: str, gen_length: int = 2048
+) -> Tuple[str, int]:
+    """CLAD v3：O1/O2 + O3 批量 Phase-2 forward + O4 级联草稿（top-2 L1 + L2 二次接受）。"""
+    cfg = CladV3Config(
+        top_v=4,
+        num_lookahead=2,
+        consistency_weight=0.5,
+        entropy_weight=0.2,
+        lookahead_warmup=3,
+        accept_threshold2=0.90,
+        use_batched_phase2=True,
+        use_cascaded_draft=True,
+        gen_length=gen_length,
+        block_length=32,
+        threshold=0.7,
+        editing_threshold=0.5,
+        temperature=0.0,
+        max_post_steps=16,
+        eos_early_stop=True,
+        eos_id=156892,
+        mask_id=156895,
+    )
+    return generate_with_clad_v3(model, tokenizer, prompt, cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -550,8 +585,8 @@ def main():
         "--decode_mode",
         type=str,
         default="baseline",
-        choices=["baseline", "lopa", "ccd", "clad", "clad_v2"],
-        help="解码策略名称：baseline (LLaDA2.1原生)、lopa (Lookahead Parallel Decoding)、ccd (Coherent and Consistent Decoding)、clad (CLAD v1，毕设原创) 或 clad_v2 (CLAD v2，信息密度加权+多token接受)",
+        choices=["baseline", "lopa", "ccd", "clad", "clad_v2", "clad_v3"],
+        help="解码策略：baseline / lopa / ccd / clad(v1) / clad_v2(O1+O2) / clad_v3(O1+O2+O3+O4)",
     )
     parser.add_argument(
         "--max_examples",
