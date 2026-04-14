@@ -420,13 +420,14 @@ def _run_clad_generate(
 def _run_clad_v2_generate(
     model, tokenizer, prompt: str, gen_length: int = 2048
 ) -> Tuple[str, int]:
-    """CLAD-v2：信息密度加权一致性评分（O1）+ 多 token 自适应接受（O2）"""
-    # 与 llada_clad_v2_decode.CladConfig 字段一致（完整 O1/O2 见 clad_v3）
+    """CLAD v2：O1 信息密度加权一致性评分 + O2 多 token 自适应接受"""
     clad_v2_config = CladV2Config(
         top_v=4,
         num_lookahead=2,
-        consistency_weight=0.6,
+        consistency_weight=0.5,  # α
+        entropy_weight=0.2,  # β（O1 新增）
         lookahead_warmup=3,
+        accept_threshold2=0.90,  # O2 阈值
         gen_length=gen_length,
         block_length=32,
         threshold=0.7,

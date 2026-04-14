@@ -110,6 +110,27 @@ def _llada_forward_logits(
 
 
 @dataclass
+class DecodeStats:
+    """generate_with_clad 调用期间各解码阶段的命中统计。"""
+
+    phase1_iters: int = 0  # 阶段一（一致性快通道）命中迭代次数
+    phase1_tokens: int = 0  # 阶段一累计接受 token 数
+    phase2_iters: int = 0  # 阶段二触发次数（warmup 后、阶段一未命中时尝试）
+    phase2_accepted: int = 0  # 阶段二成功接受次数
+    phase3_iters: int = 0  # 阶段三 fallback 次数
+    total_iters: int = 0  # 总迭代次数
+
+    def hit_rates(self) -> dict:
+        n = max(self.total_iters, 1)
+        return {
+            "phase1_hit_rate": self.phase1_iters / n,
+            "phase2_trigger_rate": self.phase2_iters / n,
+            "phase2_accepted_rate": self.phase2_accepted / n,
+            "phase3_fallback_rate": self.phase3_iters / n,
+        }
+
+
+@dataclass
 class CladConfig:
     """CLAD 解码配置参数"""
 
@@ -304,9 +325,12 @@ def generate_with_clad(
     tokenizer,
     prompt: str,
     config: Optional[CladConfig] = None,
+    stats_out: Optional[List] = None,
 ) -> Tuple[str, int]:
     """
     使用 CLAD 策略对 LLaDA2.1-mini 进行解码。
+
+    stats_out: 若传入非 None 的列表，本次调用结束后会 append 一个 DecodeStats 实例。
 
     Returns:
         (生成文本, forward_count)：主干前向次数，用于 TPF。
@@ -314,6 +338,7 @@ def generate_with_clad(
     if config is None:
         config = CladConfig()
 
+    _stats = DecodeStats() if stats_out is not None else None
     forward_counter: List[int] = [0]
 
     print(
@@ -369,6 +394,7 @@ def generate_with_clad(
             global_position_ids,
             config,
             forward_counter,
+            stats=_stats,
         )
 
         if config.eos_early_stop and config.eos_id in x[:, prompt_length:]:
@@ -385,6 +411,8 @@ def generate_with_clad(
 
     result_text = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
     print(f"[CLAD] Generation completed, total tokens: {generated_tokens.shape[1]}")
+    if stats_out is not None and _stats is not None:
+        stats_out.append(_stats)
     return result_text.strip(), forward_counter[0]
 
 
@@ -404,6 +432,7 @@ def _clad_decode_block(
     global_position_ids: torch.Tensor,
     config: CladConfig,
     forward_counter: Optional[List[int]] = None,
+    stats: Optional[DecodeStats] = None,
 ) -> torch.Tensor:
     """
     在单个 block 上执行 CLAD 解码。
@@ -452,6 +481,9 @@ def _clad_decode_block(
                 x[0, block_start:block_end][pos] = tok
                 print(f"    [CLAD] Phase-1 consistency: accepted {len(pos)} tokens")
                 accepted = True
+                if stats is not None:
+                    stats.phase1_iters += 1
+                    stats.phase1_tokens += len(pos)
 
         # ── 阶段二：一致性传播前瞻（预热后且阶段一未命中时启用）──────────
         if (
@@ -459,6 +491,8 @@ def _clad_decode_block(
             and iter_count >= config.lookahead_warmup
             and config.num_lookahead > 0
         ):
+            if stats is not None:
+                stats.phase2_iters += 1
             accepted = _clad_lookahead_fill(
                 model,
                 x,
@@ -474,10 +508,13 @@ def _clad_decode_block(
                 config,
                 device,
                 forward_counter,
+                stats=stats,
             )
 
         # ── 阶段三：退回阈值填充 ──────────────────────────────────────────
         if not accepted:
+            if stats is not None:
+                stats.phase3_iters += 1
             conf_at_mask = torch.where(
                 active_mask, token_probs, torch.tensor(float("-inf"), device=device)
             )
@@ -509,6 +546,8 @@ def _clad_decode_block(
         updated_active = x[0, block_start:block_end] == config.mask_id
         history_buffer.update(neg_ent, tokens, updated_active)
         iter_count += 1
+        if stats is not None:
+            stats.total_iters += 1
 
         if torch.equal(old_block, x[0, block_start:block_end]):
             break
@@ -531,6 +570,7 @@ def _clad_lookahead_fill(
     config: CladConfig,
     device: torch.device,
     forward_counter: Optional[List[int]] = None,
+    stats: Optional[DecodeStats] = None,
 ) -> bool:
     """
     CLAD 阶段二：一致性传播前瞻。
@@ -590,4 +630,6 @@ def _clad_lookahead_fill(
         f"    [CLAD] Phase-2 lookahead: filled pos={best_pos} "
         f"tok={best_tok} score={best_score:.3f}"
     )
+    if stats is not None:
+        stats.phase2_accepted += 1
     return True

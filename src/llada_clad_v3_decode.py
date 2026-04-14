@@ -65,6 +65,29 @@ class CladV3Config:
     mask_id: int = 156895
 
 
+@dataclass
+class DecodeStats:
+    """generate_with_clad_v3 调用期间各解码阶段的命中统计。"""
+
+    phase1_iters: int = 0  # 阶段一（一致性快通道）命中迭代次数
+    phase1_tokens: int = 0  # 阶段一累计接受 token 数
+    phase2_iters: int = 0  # 阶段二触发次数（warmup 后、阶段一未命中时尝试）
+    phase2_accepted: int = 0  # 阶段二成功接受次数（返回 True）
+    o2_iters: int = 0  # O2 额外接受第二 token 的次数
+    phase3_iters: int = 0  # 阶段三 fallback 次数
+    total_iters: int = 0  # 总迭代次数
+
+    def hit_rates(self) -> dict:
+        n = max(self.total_iters, 1)
+        return {
+            "phase1_hit_rate": self.phase1_iters / n,
+            "phase2_trigger_rate": self.phase2_iters / n,
+            "phase2_accepted_rate": self.phase2_accepted / n,
+            "o2_hit_rate": self.o2_iters / n,
+            "phase3_fallback_rate": self.phase3_iters / n,
+        }
+
+
 def _user_prompt_input_ids(tokenizer, prompt: str) -> torch.Tensor:
     chat_inp = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
@@ -296,6 +319,7 @@ def _clad_v3_lookahead_fill(
     config: CladV3Config,
     device: torch.device,
     forward_counter: Optional[List[int]] = None,
+    stats: Optional[DecodeStats] = None,
 ) -> bool:
     """
     Phase-2：O3 批量 forward + O4 级联（可选）+ O2 二次接受。
@@ -347,7 +371,13 @@ def _clad_v3_lookahead_fill(
         print(
             f"    [CLAD v3] Phase-2 (serial): pos={best_pos} tok={best_tok} score={best_score:.3f}"
         )
-        _apply_o2_second_token(x, best_logits, block_start, block_end, config)
+        o2_fired = _apply_o2_second_token(
+            x, best_logits, block_start, block_end, config
+        )
+        if stats is not None:
+            stats.phase2_accepted += 1
+            if o2_fired:
+                stats.o2_iters += 1
         return True
 
     if not config.use_batched_phase2:
@@ -402,7 +432,11 @@ def _clad_v3_lookahead_fill(
     )
 
     winner_logits = logits_b[best_j : best_j + 1]
-    _apply_o2_second_token(x, winner_logits, block_start, block_end, config)
+    o2_fired = _apply_o2_second_token(x, winner_logits, block_start, block_end, config)
+    if stats is not None:
+        stats.phase2_accepted += 1
+        if o2_fired:
+            stats.o2_iters += 1
     return True
 
 
@@ -417,6 +451,7 @@ def _clad_decode_block(
     global_position_ids: torch.Tensor,
     config: CladV3Config,
     forward_counter: Optional[List[int]] = None,
+    stats: Optional[DecodeStats] = None,
 ) -> torch.Tensor:
     device = x.device
     block_len = block_end - block_start
@@ -457,12 +492,17 @@ def _clad_decode_block(
                 x[0, block_start:block_end][pos] = tok
                 print(f"    [CLAD v3] Phase-1 consistency: accepted {len(pos)} tokens")
                 accepted = True
+                if stats is not None:
+                    stats.phase1_iters += 1
+                    stats.phase1_tokens += len(pos)
 
         if (
             not accepted
             and iter_count >= config.lookahead_warmup
             and config.num_lookahead > 0
         ):
+            if stats is not None:
+                stats.phase2_iters += 1
             accepted = _clad_v3_lookahead_fill(
                 model,
                 x,
@@ -479,9 +519,12 @@ def _clad_decode_block(
                 config,
                 device,
                 forward_counter,
+                stats=stats,
             )
 
         if not accepted:
+            if stats is not None:
+                stats.phase3_iters += 1
             conf_at_mask = torch.where(
                 active_mask, token_probs, torch.tensor(float("-inf"), device=device)
             )
@@ -491,6 +534,9 @@ def _clad_decode_block(
             else:
                 best_pos = conf_at_mask.argmax()
                 x[0, block_start:block_end][best_pos] = tokens[best_pos]
+
+        if stats is not None:
+            stats.total_iters += 1
 
         non_mask_non_prompt = (x[0, block_start:block_end] != config.mask_id) & (
             torch.arange(block_len, device=device)
@@ -523,10 +569,15 @@ def generate_with_clad_v3(
     tokenizer,
     prompt: str,
     config: Optional[CladV3Config] = None,
+    stats_out: Optional[List] = None,
 ) -> Tuple[str, int]:
+    """
+    stats_out: 若传入非 None 的列表，本次调用结束后会 append 一个 DecodeStats 实例。
+    """
     if config is None:
         config = CladV3Config()
 
+    _stats = DecodeStats() if stats_out is not None else None
     forward_counter: List[int] = [0]
     print(
         f"[CLAD v3] top_v={config.top_v} num_lookahead={config.num_lookahead} "
@@ -576,6 +627,7 @@ def generate_with_clad_v3(
             global_position_ids,
             config,
             forward_counter,
+            stats=_stats,
         )
         if config.eos_early_stop and config.eos_id in x[:, prompt_length:]:
             print("[CLAD v3] EOS, stop")
@@ -590,6 +642,8 @@ def generate_with_clad_v3(
 
     result_text = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
     print(f"[CLAD v3] done, tokens={generated_tokens.shape[1]}")
+    if stats_out is not None and _stats is not None:
+        stats_out.append(_stats)
     return result_text.strip(), forward_counter[0]
 
 
