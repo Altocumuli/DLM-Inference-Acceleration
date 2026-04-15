@@ -5,7 +5,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 # 必须在 import torch 之前设置 GPU 可见性
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/etc/moreh/checkpoint/huggingface_hub")
@@ -243,24 +243,23 @@ def run_generate_single(
     prompt: str,
     decode_mode: str = "baseline",
     gen_length: int = 2048,
+    clad_overrides: Optional[Dict] = None,
+    stats_out: Optional[List] = None,
 ) -> Tuple[str, int]:
     """
     使用指定的解码策略进行生成。
-    支持的解码策略：
-    - baseline: LLaDA2.1-mini 原生的 generate 方法
-    - lopa: 基于 LoPA (Lookahead Parallel Decoding) 的多分支解码策略
-    - ccd: 基于 CCD (Coherent and Consistent Decoding) 的双步一致性加速策略
-    - clad: CLAD v1（Consistency-guided Lookahead Adaptive Decoding），毕设原创策略
-    - clad_v2: CLAD v2（与 v1 同实现入口时可切换权重）
-    - clad_v3: CLAD v3，O1/O2 + Phase-2 批量 forward（O3）+ 级联草稿（O4）
 
-    gen_length：生成区最大 token 数（不含 prompt），默认 2048。
+    clad_overrides: dict，可覆盖 CLAD v1/v2 的超参数，如：
+        {"num_lookahead": 3, "consistency_weight": 0.4,
+         "entropy_weight": 0.3, "accept_threshold2": 0.85}
+    stats_out: 若传入非 None 的列表，CLAD v1/v2 运行后会 append DecodeStats 实例，
+        可从中读取各阶段命中率。
 
     Returns:
-        (生成的文本, forward_count)：主干 model.model 的前向次数，用于计算 TPF（见 jsonl 字段 forward_count）。
+        (生成的文本, forward_count)
     """
-    # 获取实际的模型（处理 DataParallel 包装）
     actual_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    ov = clad_overrides or {}
 
     if decode_mode == "baseline":
         return _run_baseline_generate(
@@ -274,11 +273,21 @@ def run_generate_single(
         return _run_ccd_generate(actual_model, tokenizer, prompt, gen_length=gen_length)
     if decode_mode == "clad":
         return _run_clad_generate(
-            actual_model, tokenizer, prompt, gen_length=gen_length
+            actual_model,
+            tokenizer,
+            prompt,
+            gen_length=gen_length,
+            overrides=ov,
+            stats_out=stats_out,
         )
     if decode_mode == "clad_v2":
         return _run_clad_v2_generate(
-            actual_model, tokenizer, prompt, gen_length=gen_length
+            actual_model,
+            tokenizer,
+            prompt,
+            gen_length=gen_length,
+            overrides=ov,
+            stats_out=stats_out,
         )
     if decode_mode == "clad_v3":
         return _run_clad_v3_generate(
@@ -395,14 +404,20 @@ def _run_ccd_generate(
 
 
 def _run_clad_generate(
-    model, tokenizer, prompt: str, gen_length: int = 2048
+    model,
+    tokenizer,
+    prompt: str,
+    gen_length: int = 2048,
+    overrides: Optional[Dict] = None,
+    stats_out: Optional[List] = None,
 ) -> Tuple[str, int]:
-    """CLAD (Consistency-guided Lookahead Adaptive Decoding) 毕设原创解码策略"""
+    """CLAD v1（Consistency-guided Lookahead Adaptive Decoding）"""
+    ov = overrides or {}
     clad_config = CladConfig(
-        top_v=4,
-        num_lookahead=2,
-        consistency_weight=0.6,
-        lookahead_warmup=3,
+        top_v=ov.get("top_v", 4),
+        num_lookahead=ov.get("num_lookahead", 2),
+        consistency_weight=ov.get("consistency_weight", 0.6),
+        lookahead_warmup=ov.get("lookahead_warmup", 3),
         gen_length=gen_length,
         block_length=32,
         threshold=0.7,
@@ -413,21 +428,29 @@ def _run_clad_generate(
         eos_id=156892,
         mask_id=156895,
     )
-    text, n_fw = generate_with_clad(model, tokenizer, prompt, clad_config)
+    text, n_fw = generate_with_clad(
+        model, tokenizer, prompt, clad_config, stats_out=stats_out
+    )
     return text, n_fw
 
 
 def _run_clad_v2_generate(
-    model, tokenizer, prompt: str, gen_length: int = 2048
+    model,
+    tokenizer,
+    prompt: str,
+    gen_length: int = 2048,
+    overrides: Optional[Dict] = None,
+    stats_out: Optional[List] = None,
 ) -> Tuple[str, int]:
     """CLAD v2：O1 信息密度加权一致性评分 + O2 多 token 自适应接受"""
+    ov = overrides or {}
     clad_v2_config = CladV2Config(
-        top_v=4,
-        num_lookahead=2,
-        consistency_weight=0.5,  # α
-        entropy_weight=0.2,  # β（O1 新增）
-        lookahead_warmup=3,
-        accept_threshold2=0.90,  # O2 阈值
+        top_v=ov.get("top_v", 4),
+        num_lookahead=ov.get("num_lookahead", 2),
+        consistency_weight=ov.get("consistency_weight", 0.5),
+        entropy_weight=ov.get("entropy_weight", 0.2),
+        lookahead_warmup=ov.get("lookahead_warmup", 3),
+        accept_threshold2=ov.get("accept_threshold2", 0.90),
         gen_length=gen_length,
         block_length=32,
         threshold=0.7,
@@ -438,7 +461,9 @@ def _run_clad_v2_generate(
         eos_id=156892,
         mask_id=156895,
     )
-    text, n_fw = generate_with_clad_v2(model, tokenizer, prompt, clad_v2_config)
+    text, n_fw = generate_with_clad_v2(
+        model, tokenizer, prompt, clad_v2_config, stats_out=stats_out
+    )
     return text, n_fw
 
 
@@ -595,7 +620,47 @@ def main():
         default=None,
         help="最多跑多少条样本（默认全部）",
     )
+    # ── CLAD 超参数覆盖（消融实验用）────────────────────────────────────────
+    parser.add_argument(
+        "--clad_k",
+        type=int,
+        default=None,
+        metavar="K",
+        help="覆盖 CLAD v1/v2 的 num_lookahead（前瞻分支数，默认 v1=2 / v2=2）",
+    )
+    parser.add_argument(
+        "--clad_alpha",
+        type=float,
+        default=None,
+        metavar="α",
+        help="覆盖 CLAD v1/v2 的 consistency_weight α（默认 v1=0.6 / v2=0.5）",
+    )
+    parser.add_argument(
+        "--clad_beta",
+        type=float,
+        default=None,
+        metavar="β",
+        help="覆盖 CLAD v2 的 entropy_weight β（默认 0.2；v1 无此参数）",
+    )
+    parser.add_argument(
+        "--clad_threshold2",
+        type=float,
+        default=None,
+        metavar="thr2",
+        help="覆盖 CLAD v2 的 accept_threshold2 O2 阈值（默认 0.90；1.01 可禁用 O2）",
+    )
     args = parser.parse_args()
+
+    # 构建超参数覆盖字典（仅含显式传入的参数）
+    clad_overrides: Dict = {}
+    if args.clad_k is not None:
+        clad_overrides["num_lookahead"] = args.clad_k
+    if args.clad_alpha is not None:
+        clad_overrides["consistency_weight"] = args.clad_alpha
+    if args.clad_beta is not None:
+        clad_overrides["entropy_weight"] = args.clad_beta
+    if args.clad_threshold2 is not None:
+        clad_overrides["accept_threshold2"] = args.clad_threshold2
 
     # 参数验证：必须指定 --benchmark 或 --benchmarks 中的一个
     if not args.benchmark and not args.benchmarks:
@@ -623,10 +688,33 @@ def main():
         print(f"{'='*60}")
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 若有超参数覆盖，在文件名中追加 tag，便于区分消融实验结果
+        _ov_tag = ""
+        if clad_overrides and args.decode_mode in ("clad", "clad_v2"):
+            parts = []
+            if "num_lookahead" in clad_overrides:
+                parts.append(f"k{clad_overrides['num_lookahead']}")
+            if "consistency_weight" in clad_overrides:
+                parts.append(
+                    f"a{clad_overrides['consistency_weight']:.2f}".replace(".", "")
+                )
+            if "entropy_weight" in clad_overrides:
+                parts.append(
+                    f"b{clad_overrides['entropy_weight']:.2f}".replace(".", "")
+                )
+            if "accept_threshold2" in clad_overrides:
+                parts.append(
+                    f"t2{clad_overrides['accept_threshold2']:.2f}".replace(".", "")
+                )
+            if parts:
+                _ov_tag = "_" + "_".join(parts)
         out_path = (
-            RUN_ROOT / f"{ts}_llada2_{benchmark_name}_decode={args.decode_mode}.jsonl"
+            RUN_ROOT
+            / f"{ts}_llada2_{benchmark_name}_decode={args.decode_mode}{_ov_tag}.jsonl"
         )
         print(f"[run] 输出结果将写入: {out_path}")
+        if clad_overrides:
+            print(f"[run] CLAD 超参数覆盖: {clad_overrides}")
 
         # 根据 benchmark 名称选择对应的迭代器
         if benchmark_name == "gsm8k_small":
@@ -702,12 +790,17 @@ def main():
             gen_length = 2048
 
             t_start = time.time()
+            _sample_stats: List = []
             gen_text, forward_count = run_generate_single(
                 model,
                 tokenizer,
                 prompt=q,
                 decode_mode=args.decode_mode,
                 gen_length=gen_length,
+                clad_overrides=clad_overrides if clad_overrides else None,
+                stats_out=(
+                    _sample_stats if args.decode_mode in ("clad", "clad_v2") else None
+                ),
             )
             gen_time_sec = float(time.time() - t_start)
 
@@ -738,10 +831,15 @@ def main():
                 "input_token_len": input_token_len,
                 "output_token_len": output_token_len,
                 "gen_time_sec": gen_time_sec,
-                "gen_length": gen_length,  # 本次使用的生成空间大小
-                # 解码过程中主干 Transformer 的前向次数，用于 TPF = output_token_len / forward_count
+                "gen_length": gen_length,
                 "forward_count": forward_count,
             }
+            # 若有超参数覆盖，记录实际使用的参数（消融实验追溯用）
+            if clad_overrides:
+                record["clad_overrides"] = clad_overrides
+            # 写入 CLAD 解码阶段命中率（由 DecodeStats 提供）
+            if _sample_stats:
+                record.update(_sample_stats[0].hit_rates())
 
             # 根据基准测试类型添加特定字段
             if benchmark_name in ["gsm8k_small", "aime2025_all", "math500"]:
