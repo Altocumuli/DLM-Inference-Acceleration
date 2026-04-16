@@ -862,7 +862,12 @@ def main():
                 record.update(_sample_stats[0].hit_rates())
 
             # 根据基准测试类型添加特定字段
-            if benchmark_name in ["gsm8k_small", "aime2025_all", "math500"]:
+            if benchmark_name in [
+                "gsm8k_small",
+                "gsm8k_test_only",
+                "aime2025_all",
+                "math500",
+            ]:
                 # 数学基准测试：保留原有字段名
                 record["question"] = ex["question"]
                 record["reference_answer"] = ref_ans
