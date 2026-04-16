@@ -506,6 +506,18 @@ def iter_gsm8k_examples(max_examples: int | None = None):
         yield ex
 
 
+def iter_gsm8k_test_only_examples(max_examples: int | None = None):
+    path = BENCH_ROOT / "math" / "gsm8k_testOnly.jsonl"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"未找到 {path}。请先运行: python dlm/src/download_benchmarks.py --dataset gsm8k_test_only"
+        )
+    for i, ex in enumerate(read_jsonl(path)):
+        if max_examples is not None and i >= max_examples:
+            break
+        yield ex
+
+
 def iter_aime2025_examples(max_examples: int | None = None):
     path = BENCH_ROOT / "math" / "aime2025_all.jsonl"
     for i, ex in enumerate(read_jsonl(path)):
@@ -586,6 +598,7 @@ def main():
     )
     _all_benchmarks = [
         "gsm8k_small",
+        "gsm8k_test_only",
         "math500",
         "aime2025_all",
         "humaneval_all",
@@ -719,6 +732,8 @@ def main():
         # 根据 benchmark 名称选择对应的迭代器
         if benchmark_name == "gsm8k_small":
             iterator = iter_gsm8k_examples(args.max_examples)
+        elif benchmark_name == "gsm8k_test_only":
+            iterator = iter_gsm8k_test_only_examples(args.max_examples)
         elif benchmark_name == "aime2025_all":
             iterator = iter_aime2025_examples(args.max_examples)
         elif benchmark_name == "math500":
@@ -739,7 +754,12 @@ def main():
         processed = 0
         for ex in iterator:
             # 根据 benchmark 类型获取问题/提示和参考答案
-            if benchmark_name in ["gsm8k_small", "aime2025_all", "math500"]:
+            if benchmark_name in [
+                "gsm8k_small",
+                "gsm8k_test_only",
+                "aime2025_all",
+                "math500",
+            ]:
                 # 数学基准测试：使用 "question" 字段
                 q = ex["question"]
                 ref_ans = ex.get("answer")

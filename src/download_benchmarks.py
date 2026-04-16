@@ -4,6 +4,7 @@
 from pathlib import Path
 import json
 import argparse
+import random
 from datasets import load_dataset  # 需要先: uv pip install datasets
 
 ROOT = Path(__file__).resolve().parents[1]  # 指向 dlm/
@@ -40,6 +41,48 @@ def export_gsm8k_small(n_train: int = 200, n_test: int = 100):
     out_path = OUT_DIR / "math" / "gsm8k_small.jsonl"
     save_jsonl(recs, out_path)
     print(f"[gsm8k] saved {len(recs)} examples to {out_path}")
+
+
+def export_gsm8k_test_only(n: int = 300, seed: int = 42):
+    """
+    仅从 GSM8K 官方 test split 随机抽取 n 条，便于与文献中「纯测试集」口径对齐。
+
+    输出：experiments/benchmarks/math/gsm8k_testOnly.jsonl
+    字段与 gsm8k_small 一致：id, split, question, answer。
+    id 为官方 test 中的行号 gsm8k_test_{i}，便于复现同一子集。
+    """
+    ds = load_dataset("openai/gsm8k", "main")
+    split = ds["test"]
+    total = len(split)
+    if n > total:
+        print(
+            f"[gsm8k_testOnly] 请求 n={n} 大于 test 集大小 {total}，将使用全部 {total} 条"
+        )
+        n = total
+
+    rng = random.Random(seed)
+    indices = list(range(total))
+    rng.shuffle(indices)
+    chosen = sorted(indices[:n])  # 排序后写出，文件内按原 test 索引升序，便于 diff
+
+    recs = []
+    for i in chosen:
+        row = split[i]
+        recs.append(
+            {
+                "id": f"gsm8k_test_{i}",
+                "split": "test",
+                "question": row["question"],
+                "answer": row["answer"],
+            }
+        )
+
+    out_path = OUT_DIR / "math" / "gsm8k_testOnly.jsonl"
+    save_jsonl(recs, out_path)
+    print(
+        f"[gsm8k_testOnly] saved {len(recs)} / {total} test examples "
+        f"(seed={seed}) to {out_path}"
+    )
 
 
 def export_aime2025_all():
@@ -196,6 +239,7 @@ if __name__ == "__main__":
         default="math500",
         choices=[
             "gsm8k_small",
+            "gsm8k_test_only",
             "aime2025_all",
             "mbpp_sanitized",
             "humaneval_all",
@@ -211,12 +255,26 @@ if __name__ == "__main__":
         default=300,
         help="导出 ARC 时每个子集的样本数（默认 300）",
     )
+    parser.add_argument(
+        "--gsm8k_test_only_n",
+        type=int,
+        default=300,
+        help="gsm8k_test_only：从 test split 随机抽取的条数（默认 300）",
+    )
+    parser.add_argument(
+        "--gsm8k_test_only_seed",
+        type=int,
+        default=42,
+        help="gsm8k_test_only：随机种子，保证子集可复现（默认 42）",
+    )
     args = parser.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.dataset in ("gsm8k_small", "all"):
         export_gsm8k_small()
+    if args.dataset in ("gsm8k_test_only", "all"):
+        export_gsm8k_test_only(n=args.gsm8k_test_only_n, seed=args.gsm8k_test_only_seed)
     if args.dataset in ("aime2025_all", "all"):
         export_aime2025_all()
     if args.dataset in ("mbpp_sanitized", "all"):
