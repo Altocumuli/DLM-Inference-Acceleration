@@ -232,6 +232,18 @@ def append_jsonl(path: Path, records: List[Dict]):
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
+def load_completed_sample_ids(path: Path) -> set:
+    """读取已有结果文件中的 sample id，用于续跑时跳过已完成样本。"""
+    if not path.is_file():
+        return set()
+    done_ids = set()
+    for row in read_jsonl(path):
+        sample_id = row.get("id")
+        if sample_id is not None:
+            done_ids.add(sample_id)
+    return done_ids
+
+
 # ---------------------------------------------------------------------------
 # 4. 构造 chat 输入并调用 generate（baseline 策略）
 # ---------------------------------------------------------------------------
@@ -662,6 +674,12 @@ def main():
         metavar="thr2",
         help="覆盖 CLAD v2 的 accept_threshold2 O2 阈值（默认 0.90；1.01 可禁用 O2）",
     )
+    parser.add_argument(
+        "--resume_file",
+        type=str,
+        default=None,
+        help="续跑已有 jsonl 结果文件：读取已完成样本 id，跳过后继续 append 到该文件",
+    )
     args = parser.parse_args()
 
     # 构建超参数覆盖字典（仅含显式传入的参数）
@@ -680,6 +698,8 @@ def main():
         parser.error("必须指定 --benchmark 或 --benchmarks 中的一个")
     if args.benchmark and args.benchmarks:
         parser.error("不能同时指定 --benchmark 和 --benchmarks")
+    if args.resume_file and args.benchmarks:
+        parser.error("--resume_file 目前仅支持与单个 --benchmark 一起使用")
 
     # 确定要处理的 benchmark 列表
     if args.benchmark:
@@ -721,13 +741,44 @@ def main():
                 )
             if parts:
                 _ov_tag = "_" + "_".join(parts)
-        out_path = (
-            RUN_ROOT
-            / f"{ts}_llada2_{benchmark_name}_decode={args.decode_mode}{_ov_tag}.jsonl"
-        )
+        if args.resume_file:
+            out_path = Path(args.resume_file)
+        else:
+            out_path = (
+                RUN_ROOT
+                / f"{ts}_llada2_{benchmark_name}_decode={args.decode_mode}{_ov_tag}.jsonl"
+            )
         print(f"[run] 输出结果将写入: {out_path}")
         if clad_overrides:
             print(f"[run] CLAD 超参数覆盖: {clad_overrides}")
+
+        completed_ids = set()
+        if args.resume_file:
+            if not out_path.is_file():
+                parser.error(f"--resume_file 指向的文件不存在: {out_path}")
+            existing_rows = list(read_jsonl(out_path))
+            if existing_rows:
+                first = existing_rows[0]
+                file_benchmark = first.get("benchmark")
+                file_decode_mode = first.get("decode_mode")
+                if file_benchmark != benchmark_name:
+                    parser.error(
+                        f"--resume_file benchmark 不匹配：文件中是 {file_benchmark}，当前是 {benchmark_name}"
+                    )
+                if file_decode_mode != args.decode_mode:
+                    parser.error(
+                        f"--resume_file decode_mode 不匹配：文件中是 {file_decode_mode}，当前是 {args.decode_mode}"
+                    )
+                file_overrides = first.get("clad_overrides")
+                if (file_overrides or None) != (clad_overrides or None):
+                    parser.error(
+                        "--resume_file 的 clad_overrides 与当前命令不一致，"
+                        f"文件中是 {file_overrides}，当前是 {clad_overrides or None}"
+                    )
+            completed_ids = load_completed_sample_ids(out_path)
+            print(
+                f"[resume] 已完成样本数: {len(completed_ids)}，将跳过这些 id 并继续追加写入"
+            )
 
         # 根据 benchmark 名称选择对应的迭代器
         if benchmark_name == "gsm8k_small":
@@ -752,7 +803,13 @@ def main():
 
         # 处理当前 benchmark 的所有样本
         processed = 0
+        skipped_completed = 0
         for ex in iterator:
+            sample_id = ex.get("id")
+            if sample_id in completed_ids:
+                skipped_completed += 1
+                continue
+
             # 根据 benchmark 类型获取问题/提示和参考答案
             if benchmark_name in [
                 "gsm8k_small",
@@ -785,8 +842,6 @@ def main():
             else:
                 print(f"[错误] 未知 benchmark 类型: {benchmark_name}，跳过样本")
                 continue
-
-            sample_id = ex.get("id")
 
             print(f"\n[{benchmark_name}|id={sample_id}] 开始生成...")
             # 与真实送入模型的 chat 模板一致（用于统计 prompt token 数）
@@ -897,7 +952,10 @@ def main():
             append_jsonl(out_path, [record])
             processed += 1
 
-        print(f"[{benchmark_name}] 完成，样本数: {processed}，结果保存在: {out_path}")
+        print(
+            f"[{benchmark_name}] 完成，新增样本数: {processed}，"
+            f"跳过已完成样本数: {skipped_completed}，结果保存在: {out_path}"
+        )
         total_processed += processed
 
     print(f"\n[全部完成] 总共处理样本数: {total_processed}")
