@@ -6,14 +6,17 @@ CLAD 个案分析脚本
 
 用法：
     cd /home/qinghua/yangjh
-    # 分析 GSM8K 第 3 条和第 10 条
+    # 按下标分析 GSM8K 第 3 条和第 10 条
     python dlm/src/clad_case_study.py --benchmark gsm8k --indices 3 10
 
-    # 分析 MATH500 level-5 题目（先列出 level5 id，再用 --sample_id 精确指定）
-    python dlm/src/clad_case_study.py --benchmark math500 --indices 0 5 --level5_only
+    # 按真实 sample_id 直接复盘 shortlist 样本
+    python dlm/src/clad_case_study.py --benchmark gsm8k_test_only --sample_id gsm8k_test_42
+
+    # 分析 MATH500 level-5 题目（支持 index 或 sample_id）
+    python dlm/src/clad_case_study.py --benchmark math500 --sample_id math500_17 --level5_only
 
     # 指定输出目录
-    python dlm/src/clad_case_study.py --benchmark gsm8k --indices 0 --out_dir dlm/experiments/case_study
+    python dlm/src/clad_case_study.py --benchmark gsm8k_test_only --sample_id gsm8k_test_42 --out_dir dlm/experiments/case_study
 
 输出：
     <out_dir>/case_<benchmark>_<idx>_<ts>.json    -- 完整逐步日志 + 最终文本
@@ -250,7 +253,7 @@ def make_markdown(
     results: Dict[str, dict],
 ) -> str:
     question = sample.get("question", sample.get("prompt", ""))
-    gold = sample.get("answer", "")
+    gold = sample.get("reference_answer", sample.get("answer", ""))
 
     lines = []
     lines.append("## 个案分析")
@@ -325,11 +328,24 @@ def make_markdown(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _sample_label(sample: dict, fallback_idx: int) -> str:
+    sample_id = sample.get("id")
+    return str(sample_id) if sample_id is not None else str(fallback_idx)
+
+
+def _safe_name(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
+
+
 def load_samples(
-    benchmark: str, indices: List[int], level5_only: bool = False
+    benchmark: str,
+    indices: Optional[List[int]] = None,
+    sample_ids: Optional[List[str]] = None,
+    level5_only: bool = False,
 ) -> List[Tuple[int, dict]]:
     bench_files = {
         "gsm8k": BENCH_ROOT / "math" / "gsm8k_small.jsonl",
+        "gsm8k_test_only": BENCH_ROOT / "math" / "gsm8k_testOnly.jsonl",
         "arc_challenge": BENCH_ROOT / "arc" / "arc_challenge_all.jsonl",
         "math500": BENCH_ROOT / "math" / "math500.jsonl",
     }
@@ -348,10 +364,33 @@ def load_samples(
                 continue
             all_samples.append(obj)
 
-    chosen = []
-    for idx in indices:
+    chosen: List[Tuple[int, dict]] = []
+    used = set()
+
+    if sample_ids:
+        id_to_sample = {}
+        for idx, sample in enumerate(all_samples):
+            sid = sample.get("id")
+            if sid is not None:
+                id_to_sample[str(sid)] = (idx, sample)
+
+        for sid in sample_ids:
+            hit = id_to_sample.get(str(sid))
+            if hit is None:
+                print(f"[WARN] sample_id {sid!r} not found in {path}")
+                continue
+            idx, sample = hit
+            if idx in used:
+                continue
+            chosen.append((idx, sample))
+            used.add(idx)
+
+    for idx in indices or []:
         if idx < len(all_samples):
+            if idx in used:
+                continue
             chosen.append((idx, all_samples[idx]))
+            used.add(idx)
         else:
             print(f"[WARN] index {idx} out of range ({len(all_samples)} samples)")
     return chosen
@@ -361,15 +400,21 @@ def main():
     parser = argparse.ArgumentParser(description="CLAD 个案分析")
     parser.add_argument(
         "--benchmark",
-        choices=["gsm8k", "arc_challenge", "math500"],
+        choices=["gsm8k", "gsm8k_test_only", "arc_challenge", "math500"],
         default="gsm8k",
     )
     parser.add_argument(
         "--indices",
-        nargs="+",
+        nargs="*",
         type=int,
-        default=[0],
+        default=None,
         help="要分析的样本下标（0-based）",
+    )
+    parser.add_argument(
+        "--sample_id",
+        nargs="*",
+        default=None,
+        help="按 benchmark jsonl 中的真实 id 直接选样，可一次传多个",
     )
     parser.add_argument(
         "--level5_only",
@@ -384,6 +429,8 @@ def main():
         default=str(ROOT / "experiments" / "case_study"),
     )
     args = parser.parse_args()
+    if not args.indices and not args.sample_id:
+        args.indices = [0]
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -403,16 +450,22 @@ def main():
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(mid, trust_remote_code=True)
 
-    samples = load_samples(args.benchmark, args.indices, args.level5_only)
+    samples = load_samples(
+        args.benchmark,
+        indices=args.indices,
+        sample_ids=args.sample_id,
+        level5_only=args.level5_only,
+    )
     print(f"[case_study] {len(samples)} samples to analyze")
 
     strategies = ["baseline", "clad_v1", "clad_v2"]
 
     for sample_idx, sample in samples:
         question = sample.get("question", sample.get("prompt", ""))
-        gold = sample.get("answer", "")
+        gold = sample.get("reference_answer", sample.get("answer", ""))
+        sample_label = _sample_label(sample, sample_idx)
         print(f"\n{'='*60}")
-        print(f"[case_study] Sample #{sample_idx}  gold={gold!r}")
+        print(f"[case_study] Sample #{sample_idx} id={sample_label} gold={gold!r}")
         print(f"Question: {question[:150]}...")
         print("=" * 60)
 
@@ -438,10 +491,12 @@ def main():
             }
 
         # 写 JSON
-        json_path = out_dir / f"case_{args.benchmark}_{sample_idx}_{ts}.json"
+        stem = _safe_name(sample_label)
+        json_path = out_dir / f"case_{args.benchmark}_{stem}_{ts}.json"
         payload = {
             "benchmark": args.benchmark,
             "sample_idx": sample_idx,
+            "sample_id": sample.get("id"),
             "question": question,
             "gold_answer": gold,
             "results": results,
@@ -450,7 +505,7 @@ def main():
             json.dump(payload, f, ensure_ascii=False, indent=2)
 
         # 写 Markdown
-        md_path = out_dir / f"case_{args.benchmark}_{sample_idx}_{ts}.md"
+        md_path = out_dir / f"case_{args.benchmark}_{stem}_{ts}.md"
         md = make_markdown(sample, args.benchmark, results)
         md_path.write_text(md, encoding="utf-8")
 
