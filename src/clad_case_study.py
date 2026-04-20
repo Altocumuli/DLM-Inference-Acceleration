@@ -52,7 +52,6 @@ from llada_clad_v2_decode import (
     generate_with_clad as generate_with_clad_v2,
 )
 
-MODEL_ID = "GSAI-ML/LLaDA2.1-mini-Instruct"
 ROOT = Path(__file__).resolve().parents[1]
 BENCH_ROOT = ROOT / "experiments" / "benchmarks"
 
@@ -60,7 +59,7 @@ BENCH_ROOT = ROOT / "experiments" / "benchmarks"
 # Baseline 生成（直接调用 model.generate）
 # ─────────────────────────────────────────────────────────────────────────────
 
-from run_benchmark_llada2 import _run_baseline_generate  # type: ignore[import]
+from run_benchmark_llada2 import MODEL_ID, _run_baseline_generate  # type: ignore[import]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

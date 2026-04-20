@@ -99,6 +99,16 @@ def _judge_correctness(
 
 
 def _strategy_summary(name: str, sample: dict, correct: bool) -> dict:
+    has_phase_stats = any(
+        key in sample
+        for key in (
+            "phase1_hit_rate",
+            "phase2_trigger_rate",
+            "phase2_accepted_rate",
+            "o2_hit_rate",
+            "phase3_fallback_rate",
+        )
+    )
     return {
         "strategy": name,
         "decode_mode": sample.get("decode_mode"),
@@ -111,6 +121,7 @@ def _strategy_summary(name: str, sample: dict, correct: bool) -> dict:
         "phase2_accepted_rate": _phase_rate(sample, "phase2_accepted_rate"),
         "o2_hit_rate": _phase_rate(sample, "o2_hit_rate"),
         "phase3_fallback_rate": _phase_rate(sample, "phase3_fallback_rate"),
+        "has_phase_stats": has_phase_stats,
         "model_answer_preview": (sample.get("model_answer") or "")[:240],
     }
 
@@ -180,7 +191,8 @@ def _build_case2(sample: dict, baseline: dict, v1: dict, v2: dict) -> Optional[d
     )
     if not has_gain:
         return None
-    if v2["phase2_accepted_rate"] <= 0 and v2["o2_hit_rate"] <= 0:
+    has_phase_stats = bool(v2.get("has_phase_stats", False))
+    if has_phase_stats and v2["phase2_accepted_rate"] <= 0 and v2["o2_hit_rate"] <= 0:
         return None
 
     score = 0.0
@@ -192,14 +204,21 @@ def _build_case2(sample: dict, baseline: dict, v1: dict, v2: dict) -> Optional[d
             min(baseline["gen_time_sec"], v1["gen_time_sec"]), v2["gen_time_sec"]
         ),
     )
-    score += 1.2 * v2["phase2_accepted_rate"]
-    score += 1.0 * v2["o2_hit_rate"]
+    if has_phase_stats:
+        score += 1.2 * v2["phase2_accepted_rate"]
+        score += 1.0 * v2["o2_hit_rate"]
 
     return {
         "case_type": "case2_arc_v2_advantage",
         "rank_score": round(score, 6),
         "selection_reason": (
             "v2 delivers accuracy and/or latency gains with visible Phase-2/O2 activity."
+            if has_phase_stats
+            else "v2 delivers accuracy and/or latency gains, but this run lacks phase-rate "
+            "fields; shortlist first, then verify Phase-2/O2 by case replay."
+        ),
+        "phase_signal_mode": (
+            "strict" if has_phase_stats else "relaxed_missing_phase_stats"
         ),
     }
 
@@ -320,11 +339,14 @@ def _markdown_for_case(case_type: str, rows: List[dict], top_k: int) -> List[str
         b = row["strategies"]["baseline"]
         v1 = row["strategies"]["clad_v1"]
         v2 = row["strategies"]["clad_v2"]
-        phase_text = (
-            f"v1 P1={_format_pct(v1['phase1_hit_rate'])}; "
-            f"v2 P2={_format_pct(v2['phase2_accepted_rate'])}, "
-            f"O2={_format_pct(v2['o2_hit_rate'])}"
-        )
+        if v2.get("has_phase_stats", False):
+            phase_text = (
+                f"v1 P1={_format_pct(v1['phase1_hit_rate'])}; "
+                f"v2 P2={_format_pct(v2['phase2_accepted_rate'])}, "
+                f"O2={_format_pct(v2['o2_hit_rate'])}"
+            )
+        else:
+            phase_text = "phase stats unavailable in source run"
         lines.append(
             f"| {idx} | {meta['id']} | {row['rank_score']:.3f} | "
             f"{int(b['correct'])}/{int(v1['correct'])}/{int(v2['correct'])} | "
