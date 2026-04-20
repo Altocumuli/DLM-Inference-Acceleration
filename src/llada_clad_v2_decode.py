@@ -80,6 +80,12 @@ class DecodeStats:
         }
 
 
+def _append_trace(trace_out: Optional[List[dict]], event: dict):
+    """将结构化事件写入 trace_out（若启用）。"""
+    if trace_out is not None:
+        trace_out.append(event)
+
+
 # ─────────────────────────────────────────────────────────────
 # 配置
 # ─────────────────────────────────────────────────────────────
@@ -331,6 +337,57 @@ def _clad_branch_score_v2(
     return float(score.item())
 
 
+def _clad_branch_score_v2_details(
+    branch_x: torch.Tensor,
+    branch_logits: torch.Tensor,
+    cur_tokens: torch.Tensor,
+    cur_logits_block: torch.Tensor,
+    block_start: int,
+    block_end: int,
+    config: CladConfig,
+) -> dict:
+    """返回 v2 分支评分细项，供 case study 解释分支选择原因。"""
+    branch_block = branch_x[0, block_start:block_end]
+    remaining_mask = branch_block == config.mask_id
+    if remaining_mask.sum() == 0:
+        return {
+            "score": 1.0,
+            "weighted_consistency": 1.0,
+            "entropy_reduction": 0.0,
+            "future_confidence": 1.0,
+            "remaining_mask_count": 0,
+        }
+
+    branch_block_logits = branch_logits[0, block_start:block_end]
+    probs = F.softmax(branch_block_logits, dim=-1)
+
+    cur_ent = _per_position_entropy(cur_logits_block)
+    br_ent = _per_position_entropy(branch_block_logits)
+
+    branch_new_tokens = probs.argmax(dim=-1)
+    matches = branch_new_tokens[remaining_mask] == cur_tokens[remaining_mask]
+    H = cur_ent[remaining_mask].clamp(min=1e-8)
+    h_sum = H.sum().clamp(min=1e-8)
+    weighted_cons = (H * matches.float()).sum() / h_sum
+
+    log_v = math.log(float(config.vocab_size))
+    ent_red = (br_ent[remaining_mask] - cur_ent[remaining_mask]) / log_v
+    ent_red = ent_red.mean().clamp(-1.0, 1.0)
+
+    max_probs = probs[remaining_mask].max(dim=-1).values
+    future_conf = max_probs.mean()
+
+    a, b = config.consistency_weight, config.entropy_weight
+    score = a * weighted_cons + b * ent_red + (1.0 - a - b) * future_conf
+    return {
+        "score": float(score.item()),
+        "weighted_consistency": float(weighted_cons.item()),
+        "entropy_reduction": float(ent_red.item()),
+        "future_confidence": float(future_conf.item()),
+        "remaining_mask_count": int(remaining_mask.sum().item()),
+    }
+
+
 # ─────────────────────────────────────────────────────────────
 # O2：利用已有 logits 额外接受第二个 token
 # ─────────────────────────────────────────────────────────────
@@ -342,7 +399,7 @@ def _apply_o2_second_token(
     block_start: int,
     block_end: int,
     config: CladConfig,
-) -> bool:
+) -> dict:
     """
     在已写入 Level-1 一个 token 后的序列 x 上，
     利用 branch_logits_1（填该 token 后的前向结果）
@@ -351,26 +408,41 @@ def _apply_o2_second_token(
     零额外 forward 成本。
 
     Returns:
-        True 表示成功写入第二个 token。
+        包含 fired / best_pos / best_token / best_prob 等信息的 dict。
     """
     branch_block = x[0, block_start:block_end]
     remaining_mask = branch_block == config.mask_id
     if remaining_mask.sum() == 0:
-        return False
+        return {
+            "fired": False,
+            "best_pos": None,
+            "best_token": None,
+            "best_prob": None,
+            "threshold2": float(config.accept_threshold2),
+        }
 
     bl = branch_logits_1[0, block_start:block_end]
     probs = F.softmax(bl, dim=-1)
     max_p, tok = probs.max(dim=-1)
     max_p = torch.where(remaining_mask, max_p, torch.tensor(-1.0, device=max_p.device))
     best_pos = max_p.argmax()
-    if max_p[best_pos].item() >= config.accept_threshold2:
-        x[0, block_start + best_pos] = tok[best_pos].item()
+    best_prob = float(max_p[best_pos].item())
+    best_token = int(tok[best_pos].item())
+    result = {
+        "fired": False,
+        "best_pos": int(best_pos.item()),
+        "best_token": best_token,
+        "best_prob": best_prob,
+        "threshold2": float(config.accept_threshold2),
+    }
+    if best_prob >= config.accept_threshold2:
+        x[0, block_start + best_pos] = best_token
         print(
             f"    [CLAD v2] O2: extra token pos={best_pos.item()} "
-            f"prob={max_p[best_pos].item():.3f}"
+            f"prob={best_prob:.3f}"
         )
-        return True
-    return False
+        result["fired"] = True
+    return result
 
 
 # ─────────────────────────────────────────────────────────────
@@ -395,6 +467,8 @@ def _clad_lookahead_fill(
     device: torch.device,
     forward_counter: Optional[List[int]] = None,
     stats: Optional[DecodeStats] = None,
+    trace_out: Optional[List[dict]] = None,
+    block_iter: Optional[int] = None,
 ) -> bool:
     """
     CLAD v2 阶段二：O1 信息密度加权评分前瞻 + O2 二次接受。
@@ -421,6 +495,8 @@ def _clad_lookahead_fill(
     best_pos = None
     best_tok = None
     best_logits = None
+    winner_details = None
+    candidate_traces = []
 
     for cand_pos in candidate_indices.tolist():
         branch_x = x[:, :current_window_end].clone()
@@ -431,7 +507,7 @@ def _clad_lookahead_fill(
                 model, branch_x, cur_attn_mask, cur_pos_ids, forward_counter
             )
 
-        score = _clad_branch_score_v2(
+        details = _clad_branch_score_v2_details(
             branch_x,
             branch_logits,
             cur_tokens,
@@ -440,12 +516,21 @@ def _clad_lookahead_fill(
             block_end,
             config,
         )
+        score = details["score"]
+        candidate_traces.append(
+            {
+                "pos": int(cand_pos),
+                "token": int(cur_tokens[cand_pos].item()),
+                **details,
+            }
+        )
 
         if score > best_score:
             best_score = score
             best_pos = cand_pos
             best_tok = cur_tokens[cand_pos].item()
             best_logits = branch_logits
+            winner_details = details
 
     if best_pos is None:
         return False
@@ -459,9 +544,29 @@ def _clad_lookahead_fill(
         stats.phase2_accepted += 1
 
     # O2：利用已有 logits 尝试接受第二个 token
-    o2_fired = _apply_o2_second_token(x, best_logits, block_start, block_end, config)
-    if o2_fired and stats is not None:
+    o2_info = _apply_o2_second_token(x, best_logits, block_start, block_end, config)
+    if o2_info["fired"] and stats is not None:
         stats.o2_iters += 1
+    accepted_positions = [int(best_pos)]
+    accepted_tokens = [int(best_tok)]
+    if o2_info["fired"] and o2_info["best_pos"] is not None:
+        accepted_positions.append(int(o2_info["best_pos"]))
+        accepted_tokens.append(int(o2_info["best_token"]))
+    _append_trace(
+        trace_out,
+        {
+            "block": int(block_start // config.block_length),
+            "iter": int(block_iter) if block_iter is not None else None,
+            "phase": "phase2",
+            "accepted_positions": accepted_positions,
+            "accepted_tokens": accepted_tokens,
+            "n_tokens": 1 + (1 if o2_info["fired"] else 0),
+            "winner_score": float(best_score),
+            "winner_details": winner_details,
+            "candidate_scores": candidate_traces,
+            "o2": o2_info,
+        },
+    )
 
     return True
 
@@ -483,6 +588,7 @@ def _clad_decode_block(
     config: CladConfig,
     forward_counter: Optional[List[int]] = None,
     stats: Optional[DecodeStats] = None,
+    trace_out: Optional[List[dict]] = None,
 ) -> torch.Tensor:
     """单个 block 上的 CLAD v2 解码（阶段一快通道 → 阶段二 O1+O2 → 阶段三 fallback）。"""
     device = x.device
@@ -529,6 +635,17 @@ def _clad_decode_block(
                 if stats is not None:
                     stats.phase1_iters += 1
                     stats.phase1_tokens += len(pos)
+                _append_trace(
+                    trace_out,
+                    {
+                        "block": int(block_start // config.block_length),
+                        "iter": int(iter_count),
+                        "phase": "phase1",
+                        "accepted_positions": [int(p) for p in pos.tolist()],
+                        "accepted_tokens": [int(t) for t in tok.tolist()],
+                        "n_tokens": int(len(pos)),
+                    },
+                )
 
         # ── 阶段二：O1 加权评分前瞻 + O2 二次接受 ─────────────────────────
         if (
@@ -555,6 +672,8 @@ def _clad_decode_block(
                 device,
                 forward_counter,
                 stats=stats,
+                trace_out=trace_out,
+                block_iter=iter_count,
             )
 
         # ── 阶段三：退回阈值填充 ────────────────────────────────────────────
@@ -567,9 +686,42 @@ def _clad_decode_block(
             high_conf = (conf_at_mask > config.threshold) & active_mask
             if high_conf.any():
                 x[0, block_start:block_end][high_conf] = tokens[high_conf]
+                accepted_positions = torch.nonzero(high_conf, as_tuple=False).view(-1)
+                _append_trace(
+                    trace_out,
+                    {
+                        "block": int(block_start // config.block_length),
+                        "iter": int(iter_count),
+                        "phase": "phase3",
+                        "fallback_mode": "threshold_multi",
+                        "accepted_positions": [
+                            int(p) for p in accepted_positions.tolist()
+                        ],
+                        "accepted_tokens": [
+                            int(tokens[p].item()) for p in accepted_positions
+                        ],
+                        "accepted_probs": [
+                            float(token_probs[p].item()) for p in accepted_positions
+                        ],
+                        "n_tokens": int(accepted_positions.numel()),
+                    },
+                )
             else:
                 best_pos = conf_at_mask.argmax()
                 x[0, block_start:block_end][best_pos] = tokens[best_pos]
+                _append_trace(
+                    trace_out,
+                    {
+                        "block": int(block_start // config.block_length),
+                        "iter": int(iter_count),
+                        "phase": "phase3",
+                        "fallback_mode": "argmax_single",
+                        "accepted_positions": [int(best_pos.item())],
+                        "accepted_tokens": [int(tokens[best_pos].item())],
+                        "accepted_probs": [float(token_probs[best_pos].item())],
+                        "n_tokens": 1,
+                    },
+                )
 
         # ── 编辑已生成 token ────────────────────────────────────────────────
         non_mask_non_prompt = (x[0, block_start:block_end] != config.mask_id) & (
@@ -612,6 +764,7 @@ def generate_with_clad(
     prompt: str,
     config: Optional[CladConfig] = None,
     stats_out: Optional[List] = None,
+    trace_out: Optional[List[dict]] = None,
 ) -> Tuple[str, int]:
     """
     使用 CLAD v2 策略（O1 + O2）对 LLaDA2.1-mini 进行解码。
@@ -679,6 +832,7 @@ def generate_with_clad(
             config,
             forward_counter,
             stats=_stats,
+            trace_out=trace_out,
         )
 
         if config.eos_early_stop and config.eos_id in x[:, prompt_length:]:

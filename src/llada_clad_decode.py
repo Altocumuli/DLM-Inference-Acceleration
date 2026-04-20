@@ -130,6 +130,12 @@ class DecodeStats:
         }
 
 
+def _append_trace(trace_out: Optional[List[dict]], event: dict):
+    """将结构化事件写入 trace_out（若启用）。"""
+    if trace_out is not None:
+        trace_out.append(event)
+
+
 @dataclass
 class CladConfig:
     """CLAD 解码配置参数"""
@@ -315,6 +321,45 @@ def _clad_branch_score(
     return alpha * consistency_prop + (1.0 - alpha) * future_conf
 
 
+def _clad_branch_score_details(
+    branch_x: torch.Tensor,
+    branch_logits: torch.Tensor,
+    cur_tokens: torch.Tensor,
+    block_start: int,
+    block_end: int,
+    config: CladConfig,
+) -> dict:
+    """返回 v1 分支评分细项，便于个案分析解释。"""
+    branch_block = branch_x[0, block_start:block_end]
+    remaining_mask = branch_block == config.mask_id
+
+    if remaining_mask.sum() == 0:
+        return {
+            "score": 1.0,
+            "consistency_propagation": 1.0,
+            "future_confidence": 1.0,
+            "remaining_mask_count": 0,
+        }
+
+    branch_block_logits = branch_logits[0, block_start:block_end]
+    probs = F.softmax(branch_block_logits, dim=-1)
+    max_probs = probs[remaining_mask].max(dim=-1).values
+    future_conf = max_probs.mean().item()
+
+    branch_new_tokens = probs.argmax(dim=-1)
+    matches = branch_new_tokens[remaining_mask] == cur_tokens[remaining_mask]
+    consistency_prop = matches.float().mean().item()
+
+    alpha = config.consistency_weight
+    score = alpha * consistency_prop + (1.0 - alpha) * future_conf
+    return {
+        "score": float(score),
+        "consistency_propagation": float(consistency_prop),
+        "future_confidence": float(future_conf),
+        "remaining_mask_count": int(remaining_mask.sum().item()),
+    }
+
+
 # ─────────────────────────────────────────────────────────────
 # 主入口
 # ─────────────────────────────────────────────────────────────
@@ -326,6 +371,7 @@ def generate_with_clad(
     prompt: str,
     config: Optional[CladConfig] = None,
     stats_out: Optional[List] = None,
+    trace_out: Optional[List[dict]] = None,
 ) -> Tuple[str, int]:
     """
     使用 CLAD 策略对 LLaDA2.1-mini 进行解码。
@@ -395,6 +441,7 @@ def generate_with_clad(
             config,
             forward_counter,
             stats=_stats,
+            trace_out=trace_out,
         )
 
         if config.eos_early_stop and config.eos_id in x[:, prompt_length:]:
@@ -433,6 +480,7 @@ def _clad_decode_block(
     config: CladConfig,
     forward_counter: Optional[List[int]] = None,
     stats: Optional[DecodeStats] = None,
+    trace_out: Optional[List[dict]] = None,
 ) -> torch.Tensor:
     """
     在单个 block 上执行 CLAD 解码。
@@ -484,6 +532,17 @@ def _clad_decode_block(
                 if stats is not None:
                     stats.phase1_iters += 1
                     stats.phase1_tokens += len(pos)
+                _append_trace(
+                    trace_out,
+                    {
+                        "block": int(block_start // config.block_length),
+                        "iter": int(iter_count),
+                        "phase": "phase1",
+                        "accepted_positions": [int(p) for p in pos.tolist()],
+                        "accepted_tokens": [int(t) for t in tok.tolist()],
+                        "n_tokens": int(len(pos)),
+                    },
+                )
 
         # ── 阶段二：一致性传播前瞻（预热后且阶段一未命中时启用）──────────
         if (
@@ -509,6 +568,8 @@ def _clad_decode_block(
                 device,
                 forward_counter,
                 stats=stats,
+                trace_out=trace_out,
+                block_iter=iter_count,
             )
 
         # ── 阶段三：退回阈值填充 ──────────────────────────────────────────
@@ -521,9 +582,42 @@ def _clad_decode_block(
             high_conf = (conf_at_mask > config.threshold) & active_mask
             if high_conf.any():
                 x[0, block_start:block_end][high_conf] = tokens[high_conf]
+                accepted_positions = torch.nonzero(high_conf, as_tuple=False).view(-1)
+                _append_trace(
+                    trace_out,
+                    {
+                        "block": int(block_start // config.block_length),
+                        "iter": int(iter_count),
+                        "phase": "phase3",
+                        "fallback_mode": "threshold_multi",
+                        "accepted_positions": [
+                            int(p) for p in accepted_positions.tolist()
+                        ],
+                        "accepted_tokens": [
+                            int(tokens[p].item()) for p in accepted_positions
+                        ],
+                        "accepted_probs": [
+                            float(token_probs[p].item()) for p in accepted_positions
+                        ],
+                        "n_tokens": int(accepted_positions.numel()),
+                    },
+                )
             else:
                 best_pos = conf_at_mask.argmax()
                 x[0, block_start:block_end][best_pos] = tokens[best_pos]
+                _append_trace(
+                    trace_out,
+                    {
+                        "block": int(block_start // config.block_length),
+                        "iter": int(iter_count),
+                        "phase": "phase3",
+                        "fallback_mode": "argmax_single",
+                        "accepted_positions": [int(best_pos.item())],
+                        "accepted_tokens": [int(tokens[best_pos].item())],
+                        "accepted_probs": [float(token_probs[best_pos].item())],
+                        "n_tokens": 1,
+                    },
+                )
 
         # ── 编辑已生成 token（与原生 generate 一致）──────────────────────
         non_mask_non_prompt = (x[0, block_start:block_end] != config.mask_id) & (
@@ -571,6 +665,8 @@ def _clad_lookahead_fill(
     device: torch.device,
     forward_counter: Optional[List[int]] = None,
     stats: Optional[DecodeStats] = None,
+    trace_out: Optional[List[dict]] = None,
+    block_iter: Optional[int] = None,
 ) -> bool:
     """
     CLAD 阶段二：一致性传播前瞻。
@@ -597,6 +693,7 @@ def _clad_lookahead_fill(
     best_score = -1.0
     best_pos = None
     best_tok = None
+    candidate_traces = []
 
     for cand_pos in candidate_indices.tolist():
         # 构造前瞻分支：填入 cand_pos 位置的 token
@@ -608,13 +705,21 @@ def _clad_lookahead_fill(
                 model, branch_x, cur_attn_mask, cur_pos_ids, forward_counter
             )
 
-        score = _clad_branch_score(
+        details = _clad_branch_score_details(
             branch_x,
             branch_logits,
             cur_tokens,
             block_start,
             block_end,
             config,
+        )
+        score = details["score"]
+        candidate_traces.append(
+            {
+                "pos": int(cand_pos),
+                "token": int(cur_tokens[cand_pos].item()),
+                **details,
+            }
         )
 
         if score > best_score:
@@ -632,4 +737,17 @@ def _clad_lookahead_fill(
     )
     if stats is not None:
         stats.phase2_accepted += 1
+    _append_trace(
+        trace_out,
+        {
+            "block": int(block_start // config.block_length),
+            "iter": int(block_iter) if block_iter is not None else None,
+            "phase": "phase2",
+            "accepted_positions": [int(best_pos)],
+            "accepted_tokens": [int(best_tok)],
+            "n_tokens": 1,
+            "winner_score": float(best_score),
+            "candidate_scores": candidate_traces,
+        },
+    )
     return True

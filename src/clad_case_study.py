@@ -130,6 +130,29 @@ def parse_trace(log: str, strategy: str) -> List[dict]:
     return events
 
 
+def normalize_structured_trace(trace: List[dict]) -> List[dict]:
+    """将 decoder 的结构化 trace 规整为表格友好的事件格式。"""
+    phase_name = {
+        "phase1": "Phase-1",
+        "phase2": "Phase-2",
+        "phase3": "Phase-3",
+    }
+    events: List[dict] = []
+    for item in trace:
+        positions = item.get("accepted_positions") or []
+        events.append(
+            {
+                "block": item.get("block", -1),
+                "phase": phase_name.get(item.get("phase"), str(item.get("phase"))),
+                "n_tokens": item.get("n_tokens", len(positions) or 0),
+                "pos": positions[0] if positions else None,
+                "score": item.get("winner_score"),
+                "details": item,
+            }
+        )
+    return events
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 单个策略运行（捕获 stdout）
 # ─────────────────────────────────────────────────────────────────────────────
@@ -141,9 +164,10 @@ def run_strategy(
     tokenizer,
     question: str,
     gen_length: int = 512,
-) -> Tuple[str, float, List[dict]]:
-    """运行一个策略，返回 (生成文本, 耗时, 解析事件列表)。"""
+) -> Tuple[str, float, List[dict], List[dict]]:
+    """运行一个策略，返回 (生成文本, 耗时, 表格事件, 原始结构化 trace)。"""
     buf = io.StringIO()
+    structured_trace: List[dict] = []
     t0 = time.time()
     with redirect_stdout(buf):
         if strategy == "baseline":
@@ -164,7 +188,9 @@ def run_strategy(
                 max_post_steps=16,
                 eos_early_stop=True,
             )
-            text, _ = generate_with_clad_v1(model, tokenizer, question, cfg)
+            text, _ = generate_with_clad_v1(
+                model, tokenizer, question, cfg, trace_out=structured_trace
+            )
         elif strategy == "clad_v2":
             cfg = CladV2Config(
                 top_v=4,
@@ -181,13 +207,19 @@ def run_strategy(
                 max_post_steps=16,
                 eos_early_stop=True,
             )
-            text, _ = generate_with_clad_v2(model, tokenizer, question, cfg)
+            text, _ = generate_with_clad_v2(
+                model, tokenizer, question, cfg, trace_out=structured_trace
+            )
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
     elapsed = time.time() - t0
     log = buf.getvalue()
-    events = parse_trace(log, strategy)
-    return text, elapsed, events
+    events = (
+        normalize_structured_trace(structured_trace)
+        if structured_trace
+        else parse_trace(log, strategy)
+    )
+    return text, elapsed, events, structured_trace
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -387,7 +419,7 @@ def main():
         results: Dict[str, dict] = {}
         for strat in strategies:
             print(f"\n  >> Running {strat}...")
-            text, elapsed, events = run_strategy(
+            text, elapsed, events, structured_trace = run_strategy(
                 strat, model, tokenizer, question, gen_length=args.gen_length
             )
             summ = _summarize_events(events)
@@ -402,6 +434,7 @@ def main():
                 "elapsed": round(elapsed, 3),
                 "event_summary": summ,
                 "events": events,
+                "structured_trace": structured_trace,
             }
 
         # 写 JSON
