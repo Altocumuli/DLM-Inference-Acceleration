@@ -34,6 +34,9 @@ from llada_clad_v2_decode import CladConfig as CladV2Config
 from llada_clad_v3_decode import generate_with_clad_v3
 from llada_clad_v3_decode import CladV3Config
 
+# CANDLE（Consistency-Anchored Determinism LEap）
+from llada_candle_decode import generate_with_candle, CandleConfig
+
 
 """
 用 LLaDA2.1-mini 在本地 benchmarks 上跑不同的解码策略，并记录解码效率指标。
@@ -45,6 +48,7 @@ from llada_clad_v3_decode import CladV3Config
 - clad: CLAD v1（Consistency-guided Lookahead Adaptive Decoding），毕设原创策略
 - clad_v2: CLAD v2，在 v1 基础上引入信息密度加权一致性评分（O1）和多 token 自适应接受（O2）
 - clad_v3: CLAD v3，在 v2 基础上增加 Phase-2 分支批量 forward（O3）与级联草稿前瞻（O4）
+- candle: CANDLE，在 CLAD v2 anchor 选择基础上加入局部确定性传播（local leap）
 
 当前支持的 benchmark 文件（均为 jsonl，一行一个样本）：
 - math:
@@ -261,10 +265,10 @@ def run_generate_single(
     """
     使用指定的解码策略进行生成。
 
-    clad_overrides: dict，可覆盖 CLAD v1/v2 的超参数，如：
+    clad_overrides: dict，可覆盖 CLAD/CANDLE 共享超参数，如：
         {"num_lookahead": 3, "consistency_weight": 0.4,
          "entropy_weight": 0.3, "accept_threshold2": 0.85}
-    stats_out: 若传入非 None 的列表，CLAD v1/v2 运行后会 append DecodeStats 实例，
+    stats_out: 若传入非 None 的列表，CLAD / CANDLE 运行后会 append DecodeStats 实例，
         可从中读取各阶段命中率。
 
     Returns:
@@ -301,6 +305,15 @@ def run_generate_single(
             overrides=ov,
             stats_out=stats_out,
         )
+    if decode_mode == "candle":
+        return _run_candle_generate(
+            actual_model,
+            tokenizer,
+            prompt,
+            gen_length=gen_length,
+            overrides=ov,
+            stats_out=stats_out,
+        )
     if decode_mode == "clad_v3":
         return _run_clad_v3_generate(
             actual_model, tokenizer, prompt, gen_length=gen_length
@@ -308,7 +321,7 @@ def run_generate_single(
     else:
         raise ValueError(
             f"Unsupported decode_mode: {decode_mode}. "
-            f"Supported modes: ['baseline', 'lopa', 'ccd', 'clad', 'clad_v2', 'clad_v3']"
+            f"Supported modes: ['baseline', 'lopa', 'ccd', 'clad', 'clad_v2', 'candle', 'clad_v3']"
         )
 
 
@@ -505,6 +518,38 @@ def _run_clad_v3_generate(
     return generate_with_clad_v3(model, tokenizer, prompt, cfg)
 
 
+def _run_candle_generate(
+    model,
+    tokenizer,
+    prompt: str,
+    gen_length: int = 2048,
+    overrides: Optional[Dict] = None,
+    stats_out: Optional[List] = None,
+) -> Tuple[str, int]:
+    """CANDLE：CLAD v2 anchor 选择 + winner-branch local leap。"""
+    ov = overrides or {}
+    candle_config = CandleConfig(
+        top_v=ov.get("top_v", 4),
+        num_lookahead=ov.get("num_lookahead", 2),
+        consistency_weight=ov.get("consistency_weight", 0.5),
+        entropy_weight=ov.get("entropy_weight", 0.2),
+        lookahead_warmup=ov.get("lookahead_warmup", 3),
+        accept_threshold2=ov.get("accept_threshold2", 0.90),
+        gen_length=gen_length,
+        block_length=32,
+        threshold=0.7,
+        editing_threshold=0.5,
+        temperature=0.0,
+        max_post_steps=16,
+        eos_early_stop=True,
+        eos_id=156892,
+        mask_id=156895,
+    )
+    return generate_with_candle(
+        model, tokenizer, prompt, candle_config, stats_out=stats_out
+    )
+
+
 # ---------------------------------------------------------------------------
 # 5. 针对不同 benchmark 的适配
 # ---------------------------------------------------------------------------
@@ -636,8 +681,8 @@ def main():
         "--decode_mode",
         type=str,
         default="baseline",
-        choices=["baseline", "lopa", "ccd", "clad", "clad_v2", "clad_v3"],
-        help="解码策略：baseline / lopa / ccd / clad(v1) / clad_v2(O1+O2) / clad_v3(O1+O2+O3+O4)",
+        choices=["baseline", "lopa", "ccd", "clad", "clad_v2", "candle", "clad_v3"],
+        help="解码策略：baseline / lopa / ccd / clad(v1) / clad_v2(O1+O2) / candle(anchor+local leap) / clad_v3(O1+O2+O3+O4)",
     )
     parser.add_argument(
         "--max_examples",
@@ -651,28 +696,28 @@ def main():
         type=int,
         default=None,
         metavar="K",
-        help="覆盖 CLAD v1/v2 的 num_lookahead（前瞻分支数，默认 v1=2 / v2=2）",
+        help="覆盖 CLAD/CANDLE 的 num_lookahead（前瞻分支数，默认 2）",
     )
     parser.add_argument(
         "--clad_alpha",
         type=float,
         default=None,
         metavar="α",
-        help="覆盖 CLAD v1/v2 的 consistency_weight α（默认 v1=0.6 / v2=0.5）",
+        help="覆盖 CLAD/CANDLE 的 consistency_weight α（默认 v1=0.6 / v2/CANDLE=0.5）",
     )
     parser.add_argument(
         "--clad_beta",
         type=float,
         default=None,
         metavar="β",
-        help="覆盖 CLAD v2 的 entropy_weight β（默认 0.2；v1 无此参数）",
+        help="覆盖 CLAD v2/CANDLE 的 entropy_weight β（默认 0.2；v1 无此参数）",
     )
     parser.add_argument(
         "--clad_threshold2",
         type=float,
         default=None,
         metavar="thr2",
-        help="覆盖 CLAD v2 的 accept_threshold2 O2 阈值（默认 0.90；1.01 可禁用 O2）",
+        help="覆盖 CLAD v2/CANDLE 的 accept_threshold2 阈值（默认 0.90；1.01 可禁用 O2）",
     )
     parser.add_argument(
         "--resume_file",
@@ -723,7 +768,7 @@ def main():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         # 若有超参数覆盖，在文件名中追加 tag，便于区分消融实验结果
         _ov_tag = ""
-        if clad_overrides and args.decode_mode in ("clad", "clad_v2"):
+        if clad_overrides and args.decode_mode in ("clad", "clad_v2", "candle"):
             parts = []
             if "num_lookahead" in clad_overrides:
                 parts.append(f"k{clad_overrides['num_lookahead']}")
@@ -874,7 +919,9 @@ def main():
                 gen_length=gen_length,
                 clad_overrides=clad_overrides if clad_overrides else None,
                 stats_out=(
-                    _sample_stats if args.decode_mode in ("clad", "clad_v2") else None
+                    _sample_stats
+                    if args.decode_mode in ("clad", "clad_v2", "candle")
+                    else None
                 ),
             )
             gen_time_sec = float(time.time() - t_start)
