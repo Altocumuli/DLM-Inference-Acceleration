@@ -345,7 +345,7 @@ def load_samples(
     bench_files = {
         "gsm8k": BENCH_ROOT / "math" / "gsm8k_small.jsonl",
         "gsm8k_test_only": BENCH_ROOT / "math" / "gsm8k_testOnly.jsonl",
-        "arc_challenge": BENCH_ROOT / "arc" / "arc_challenge_all.jsonl",
+        "arc_challenge": BENCH_ROOT / "reasoning" / "arc_challenge_300.jsonl",
         "math500": BENCH_ROOT / "math" / "math500.jsonl",
     }
     path = bench_files.get(benchmark)
@@ -359,7 +359,7 @@ def load_samples(
             if not line:
                 continue
             obj = json.loads(line)
-            if level5_only and obj.get("level") != "Level 5":
+            if level5_only and obj.get("level") not in (5, "5", "Level 5", "level5"):
                 continue
             all_samples.append(obj)
 
