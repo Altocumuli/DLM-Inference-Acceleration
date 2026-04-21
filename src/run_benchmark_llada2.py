@@ -535,6 +535,13 @@ def _run_candle_generate(
         entropy_weight=ov.get("entropy_weight", 0.2),
         lookahead_warmup=ov.get("lookahead_warmup", 3),
         accept_threshold2=ov.get("accept_threshold2", 0.90),
+        use_local_leap=ov.get("use_local_leap", True),
+        local_radius=ov.get("local_radius", 2),
+        local_relaxed_threshold=ov.get("local_relaxed_threshold", 0.78),
+        max_local_accept=ov.get("max_local_accept", 2),
+        anchor_score_threshold=ov.get("anchor_score_threshold", 0.0),
+        local_consistency_floor=ov.get("local_consistency_floor", 0.55),
+        local_entropy_floor=ov.get("local_entropy_floor", -0.02),
         gen_length=gen_length,
         block_length=32,
         threshold=0.7,
@@ -720,6 +727,48 @@ def main():
         help="覆盖 CLAD v2/CANDLE 的 accept_threshold2 阈值（默认 0.90；1.01 可禁用 O2）",
     )
     parser.add_argument(
+        "--candle_radius",
+        type=int,
+        default=None,
+        metavar="R",
+        help="覆盖 CANDLE 的 local_radius（局部传播半径，默认 2）",
+    )
+    parser.add_argument(
+        "--candle_relaxed_threshold",
+        type=float,
+        default=None,
+        metavar="thr_local",
+        help="覆盖 CANDLE 的 local_relaxed_threshold（默认 0.78）",
+    )
+    parser.add_argument(
+        "--candle_max_local_accept",
+        type=int,
+        default=None,
+        metavar="M",
+        help="覆盖 CANDLE 的 max_local_accept（默认 2）",
+    )
+    parser.add_argument(
+        "--candle_anchor_score_threshold",
+        type=float,
+        default=None,
+        metavar="s_anchor",
+        help="覆盖 CANDLE 的 anchor_score_threshold（默认 0.0）",
+    )
+    parser.add_argument(
+        "--candle_consistency_floor",
+        type=float,
+        default=None,
+        metavar="cons_floor",
+        help="覆盖 CANDLE 的 local_consistency_floor（默认 0.55）",
+    )
+    parser.add_argument(
+        "--candle_entropy_floor",
+        type=float,
+        default=None,
+        metavar="ent_floor",
+        help="覆盖 CANDLE 的 local_entropy_floor（默认 -0.02）",
+    )
+    parser.add_argument(
         "--resume_file",
         type=str,
         default=None,
@@ -737,6 +786,18 @@ def main():
         clad_overrides["entropy_weight"] = args.clad_beta
     if args.clad_threshold2 is not None:
         clad_overrides["accept_threshold2"] = args.clad_threshold2
+    if args.candle_radius is not None:
+        clad_overrides["local_radius"] = args.candle_radius
+    if args.candle_relaxed_threshold is not None:
+        clad_overrides["local_relaxed_threshold"] = args.candle_relaxed_threshold
+    if args.candle_max_local_accept is not None:
+        clad_overrides["max_local_accept"] = args.candle_max_local_accept
+    if args.candle_anchor_score_threshold is not None:
+        clad_overrides["anchor_score_threshold"] = args.candle_anchor_score_threshold
+    if args.candle_consistency_floor is not None:
+        clad_overrides["local_consistency_floor"] = args.candle_consistency_floor
+    if args.candle_entropy_floor is not None:
+        clad_overrides["local_entropy_floor"] = args.candle_entropy_floor
 
     # 参数验证：必须指定 --benchmark 或 --benchmarks 中的一个
     if not args.benchmark and not args.benchmarks:
@@ -784,6 +845,17 @@ def main():
                 parts.append(
                     f"t2{clad_overrides['accept_threshold2']:.2f}".replace(".", "")
                 )
+            if args.decode_mode == "candle":
+                if "local_radius" in clad_overrides:
+                    parts.append(f"r{clad_overrides['local_radius']}")
+                if "local_relaxed_threshold" in clad_overrides:
+                    parts.append(
+                        f"tl{clad_overrides['local_relaxed_threshold']:.2f}".replace(
+                            ".", ""
+                        )
+                    )
+                if "max_local_accept" in clad_overrides:
+                    parts.append(f"m{clad_overrides['max_local_accept']}")
             if parts:
                 _ov_tag = "_" + "_".join(parts)
         if args.resume_file:

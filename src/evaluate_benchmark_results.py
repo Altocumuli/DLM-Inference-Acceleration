@@ -48,6 +48,8 @@ PHASE_RATE_KEYS = [
     "phase1_hit_rate",
     "phase2_trigger_rate",
     "phase2_accepted_rate",
+    "local_leap_hit_rate",
+    "local_leap_token_rate",
     "o2_hit_rate",
     "phase3_fallback_rate",
 ]
@@ -685,6 +687,8 @@ def generate_report(
                 "phase1_hit_rate": "Phase-1 hit rate",
                 "phase2_trigger_rate": "Phase-2 trigger rate",
                 "phase2_accepted_rate": "Phase-2 accepted rate",
+                "local_leap_hit_rate": "Local-leap hit rate",
+                "local_leap_token_rate": "Local-leap token rate",
                 "o2_hit_rate": "O2 extra-accept rate",
                 "phase3_fallback_rate": "Phase-3 fallback rate",
             }
@@ -750,6 +754,8 @@ def generate_report(
                     "phase1_hit_rate": "Phase-1 hit rate",
                     "phase2_trigger_rate": "Phase-2 trigger rate",
                     "phase2_accepted_rate": "Phase-2 accepted rate",
+                    "local_leap_hit_rate": "Local-leap hit rate",
+                    "local_leap_token_rate": "Local-leap token rate",
                     "o2_hit_rate": "O2 extra-accept rate",
                     "phase3_fallback_rate": "Phase-3 fallback rate",
                 }
