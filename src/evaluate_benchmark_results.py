@@ -46,6 +46,8 @@ DEFAULT_EVALS_DIR = Path(__file__).resolve().parent.parent / "experiments" / "ev
 
 PHASE_RATE_KEYS = [
     "phase1_hit_rate",
+    "calm_neighbor_hit_rate",
+    "calm_neighbor_token_rate",
     "phase2_trigger_rate",
     "phase2_accepted_rate",
     "local_leap_hit_rate",
@@ -685,6 +687,8 @@ def generate_report(
             report_lines.append("  Decode Phase Hit Rates:")
             phase_labels = {
                 "phase1_hit_rate": "Phase-1 hit rate",
+                "calm_neighbor_hit_rate": "CALM neighbor hit rate",
+                "calm_neighbor_token_rate": "CALM neighbor token rate",
                 "phase2_trigger_rate": "Phase-2 trigger rate",
                 "phase2_accepted_rate": "Phase-2 accepted rate",
                 "local_leap_hit_rate": "Local-leap hit rate",
@@ -752,6 +756,8 @@ def generate_report(
                 report_lines.append("      Decode Phase Hit Rates:")
                 phase_labels = {
                     "phase1_hit_rate": "Phase-1 hit rate",
+                    "calm_neighbor_hit_rate": "CALM neighbor hit rate",
+                    "calm_neighbor_token_rate": "CALM neighbor token rate",
                     "phase2_trigger_rate": "Phase-2 trigger rate",
                     "phase2_accepted_rate": "Phase-2 accepted rate",
                     "local_leap_hit_rate": "Local-leap hit rate",

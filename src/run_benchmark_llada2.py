@@ -40,6 +40,9 @@ from llada_candle_decode import generate_with_candle, CandleConfig
 # CANDLE-G（CANDLE with Gated Local Propagation）
 from llada_candle_g_decode import generate_with_candle_g, CandleGConfig
 
+# CALM（Consistency-Anchored Local March）
+from llada_calm_decode import generate_with_calm, CalmConfig
+
 
 """
 用 LLaDA2.1-mini 在本地 benchmarks 上跑不同的解码策略，并记录解码效率指标。
@@ -53,6 +56,7 @@ from llada_candle_g_decode import generate_with_candle_g, CandleGConfig
 - clad_v3: CLAD v3，在 v2 基础上增加 Phase-2 分支批量 forward（O3）与级联草稿前瞻（O4）
 - candle: CANDLE，在 CLAD v2 anchor 选择基础上加入局部确定性传播（local leap）
 - candle_g: CANDLE-G，在 CANDLE 基础上加入 local score、双层 gate 与右侧传播优先
+- calm: CALM，在 Phase-1 一致性锚点基础上直接做局部多 token 接受，并在未命中时直接 fallback
 
 当前支持的 benchmark 文件（均为 jsonl，一行一个样本）：
 - math:
@@ -269,10 +273,10 @@ def run_generate_single(
     """
     使用指定的解码策略进行生成。
 
-    clad_overrides: dict，可覆盖 CLAD/CANDLE/CANDLE-G 共享超参数，如：
+    clad_overrides: dict，可覆盖 CLAD/CANDLE/CANDLE-G/CALM 共享或相近超参数，如：
         {"num_lookahead": 3, "consistency_weight": 0.4,
          "entropy_weight": 0.3, "accept_threshold2": 0.85}
-    stats_out: 若传入非 None 的列表，CLAD / CANDLE / CANDLE-G 运行后会 append DecodeStats 实例，
+    stats_out: 若传入非 None 的列表，CLAD / CANDLE / CANDLE-G / CALM 运行后会 append DecodeStats 实例，
         可从中读取各阶段命中率。
 
     Returns:
@@ -327,6 +331,15 @@ def run_generate_single(
             overrides=ov,
             stats_out=stats_out,
         )
+    if decode_mode == "calm":
+        return _run_calm_generate(
+            actual_model,
+            tokenizer,
+            prompt,
+            gen_length=gen_length,
+            overrides=ov,
+            stats_out=stats_out,
+        )
     if decode_mode == "clad_v3":
         return _run_clad_v3_generate(
             actual_model, tokenizer, prompt, gen_length=gen_length
@@ -334,7 +347,7 @@ def run_generate_single(
     else:
         raise ValueError(
             f"Unsupported decode_mode: {decode_mode}. "
-            f"Supported modes: ['baseline', 'lopa', 'ccd', 'clad', 'clad_v2', 'candle', 'candle_g', 'clad_v3']"
+            f"Supported modes: ['baseline', 'lopa', 'ccd', 'clad', 'clad_v2', 'candle', 'candle_g', 'calm', 'clad_v3']"
         )
 
 
@@ -609,6 +622,38 @@ def _run_candle_g_generate(
     )
 
 
+def _run_calm_generate(
+    model,
+    tokenizer,
+    prompt: str,
+    gen_length: int = 2048,
+    overrides: Optional[Dict] = None,
+    stats_out: Optional[List] = None,
+) -> Tuple[str, int]:
+    """CALM：Phase-1 consistency anchors + local neighborhood acceptance + fallback。"""
+    ov = overrides or {}
+    calm_config = CalmConfig(
+        top_v=ov.get("top_v", 4),
+        neighbor_radius=ov.get("neighbor_radius", 1),
+        max_neighbor_accept_per_anchor=ov.get("max_neighbor_accept_per_anchor", 1),
+        local_threshold_start=ov.get("local_threshold_start", 0.90),
+        local_threshold_end=ov.get("local_threshold_end", 0.72),
+        local_threshold_gamma=ov.get("local_threshold_gamma", 1.0),
+        gen_length=gen_length,
+        block_length=32,
+        threshold=0.7,
+        editing_threshold=0.5,
+        temperature=0.0,
+        max_post_steps=16,
+        eos_early_stop=True,
+        eos_id=156892,
+        mask_id=156895,
+    )
+    return generate_with_calm(
+        model, tokenizer, prompt, calm_config, stats_out=stats_out
+    )
+
+
 # ---------------------------------------------------------------------------
 # 5. 针对不同 benchmark 的适配
 # ---------------------------------------------------------------------------
@@ -748,9 +793,10 @@ def main():
             "clad_v2",
             "candle",
             "candle_g",
+            "calm",
             "clad_v3",
         ],
-        help="解码策略：baseline / lopa / ccd / clad(v1) / clad_v2(O1+O2) / candle(anchor+local leap) / candle_g(gated local propagation) / clad_v3(O1+O2+O3+O4)",
+        help="解码策略：baseline / lopa / ccd / clad(v1) / clad_v2(O1+O2) / candle(anchor+local leap) / candle_g(gated local propagation) / calm(consistency-anchored local acceptance) / clad_v3(O1+O2+O3+O4)",
     )
     parser.add_argument(
         "--max_examples",
@@ -835,6 +881,41 @@ def main():
         default=None,
         help="续跑已有 jsonl 结果文件：读取已完成样本 id，跳过后继续 append 到该文件",
     )
+    parser.add_argument(
+        "--calm_radius",
+        type=int,
+        default=None,
+        metavar="R",
+        help="覆盖 CALM 的 neighbor_radius（默认 1）",
+    )
+    parser.add_argument(
+        "--calm_max_accept",
+        type=int,
+        default=None,
+        metavar="M",
+        help="覆盖 CALM 的 max_neighbor_accept_per_anchor（默认 1）",
+    )
+    parser.add_argument(
+        "--calm_tau_start",
+        type=float,
+        default=None,
+        metavar="tau_s",
+        help="覆盖 CALM 的 local_threshold_start（默认 0.90）",
+    )
+    parser.add_argument(
+        "--calm_tau_end",
+        type=float,
+        default=None,
+        metavar="tau_e",
+        help="覆盖 CALM 的 local_threshold_end（默认 0.72）",
+    )
+    parser.add_argument(
+        "--calm_tau_gamma",
+        type=float,
+        default=None,
+        metavar="gamma",
+        help="覆盖 CALM 的 local_threshold_gamma（默认 1.0）",
+    )
     args = parser.parse_args()
 
     # 构建超参数覆盖字典（仅含显式传入的参数）
@@ -859,6 +940,16 @@ def main():
         clad_overrides["local_consistency_floor"] = args.candle_consistency_floor
     if args.candle_entropy_floor is not None:
         clad_overrides["local_entropy_floor"] = args.candle_entropy_floor
+    if args.calm_radius is not None:
+        clad_overrides["neighbor_radius"] = args.calm_radius
+    if args.calm_max_accept is not None:
+        clad_overrides["max_neighbor_accept_per_anchor"] = args.calm_max_accept
+    if args.calm_tau_start is not None:
+        clad_overrides["local_threshold_start"] = args.calm_tau_start
+    if args.calm_tau_end is not None:
+        clad_overrides["local_threshold_end"] = args.calm_tau_end
+    if args.calm_tau_gamma is not None:
+        clad_overrides["local_threshold_gamma"] = args.calm_tau_gamma
 
     # 参数验证：必须指定 --benchmark 或 --benchmarks 中的一个
     if not args.benchmark and not args.benchmarks:
@@ -895,6 +986,7 @@ def main():
             "clad_v2",
             "candle",
             "candle_g",
+            "calm",
         ):
             parts = []
             if "num_lookahead" in clad_overrides:
@@ -922,6 +1014,29 @@ def main():
                     )
                 if "max_local_accept" in clad_overrides:
                     parts.append(f"m{clad_overrides['max_local_accept']}")
+            if args.decode_mode == "calm":
+                if "neighbor_radius" in clad_overrides:
+                    parts.append(f"r{clad_overrides['neighbor_radius']}")
+                if "max_neighbor_accept_per_anchor" in clad_overrides:
+                    parts.append(f"m{clad_overrides['max_neighbor_accept_per_anchor']}")
+                if "local_threshold_start" in clad_overrides:
+                    parts.append(
+                        f"ts{clad_overrides['local_threshold_start']:.2f}".replace(
+                            ".", ""
+                        )
+                    )
+                if "local_threshold_end" in clad_overrides:
+                    parts.append(
+                        f"te{clad_overrides['local_threshold_end']:.2f}".replace(
+                            ".", ""
+                        )
+                    )
+                if "local_threshold_gamma" in clad_overrides:
+                    parts.append(
+                        f"g{clad_overrides['local_threshold_gamma']:.2f}".replace(
+                            ".", ""
+                        )
+                    )
             if parts:
                 _ov_tag = "_" + "_".join(parts)
         if args.resume_file:
@@ -1058,7 +1173,8 @@ def main():
                 clad_overrides=clad_overrides if clad_overrides else None,
                 stats_out=(
                     _sample_stats
-                    if args.decode_mode in ("clad", "clad_v2", "candle", "candle_g")
+                    if args.decode_mode
+                    in ("clad", "clad_v2", "candle", "candle_g", "calm")
                     else None
                 ),
             )
