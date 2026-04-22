@@ -37,6 +37,9 @@ from llada_clad_v3_decode import CladV3Config
 # CANDLE（Consistency-Anchored Determinism LEap）
 from llada_candle_decode import generate_with_candle, CandleConfig
 
+# CANDLE-G（CANDLE with Gated Local Propagation）
+from llada_candle_g_decode import generate_with_candle_g, CandleGConfig
+
 
 """
 用 LLaDA2.1-mini 在本地 benchmarks 上跑不同的解码策略，并记录解码效率指标。
@@ -49,6 +52,7 @@ from llada_candle_decode import generate_with_candle, CandleConfig
 - clad_v2: CLAD v2，在 v1 基础上引入信息密度加权一致性评分（O1）和多 token 自适应接受（O2）
 - clad_v3: CLAD v3，在 v2 基础上增加 Phase-2 分支批量 forward（O3）与级联草稿前瞻（O4）
 - candle: CANDLE，在 CLAD v2 anchor 选择基础上加入局部确定性传播（local leap）
+- candle_g: CANDLE-G，在 CANDLE 基础上加入 local score、双层 gate 与右侧传播优先
 
 当前支持的 benchmark 文件（均为 jsonl，一行一个样本）：
 - math:
@@ -265,10 +269,10 @@ def run_generate_single(
     """
     使用指定的解码策略进行生成。
 
-    clad_overrides: dict，可覆盖 CLAD/CANDLE 共享超参数，如：
+    clad_overrides: dict，可覆盖 CLAD/CANDLE/CANDLE-G 共享超参数，如：
         {"num_lookahead": 3, "consistency_weight": 0.4,
          "entropy_weight": 0.3, "accept_threshold2": 0.85}
-    stats_out: 若传入非 None 的列表，CLAD / CANDLE 运行后会 append DecodeStats 实例，
+    stats_out: 若传入非 None 的列表，CLAD / CANDLE / CANDLE-G 运行后会 append DecodeStats 实例，
         可从中读取各阶段命中率。
 
     Returns:
@@ -314,6 +318,15 @@ def run_generate_single(
             overrides=ov,
             stats_out=stats_out,
         )
+    if decode_mode == "candle_g":
+        return _run_candle_g_generate(
+            actual_model,
+            tokenizer,
+            prompt,
+            gen_length=gen_length,
+            overrides=ov,
+            stats_out=stats_out,
+        )
     if decode_mode == "clad_v3":
         return _run_clad_v3_generate(
             actual_model, tokenizer, prompt, gen_length=gen_length
@@ -321,7 +334,7 @@ def run_generate_single(
     else:
         raise ValueError(
             f"Unsupported decode_mode: {decode_mode}. "
-            f"Supported modes: ['baseline', 'lopa', 'ccd', 'clad', 'clad_v2', 'candle', 'clad_v3']"
+            f"Supported modes: ['baseline', 'lopa', 'ccd', 'clad', 'clad_v2', 'candle', 'candle_g', 'clad_v3']"
         )
 
 
@@ -557,6 +570,45 @@ def _run_candle_generate(
     )
 
 
+def _run_candle_g_generate(
+    model,
+    tokenizer,
+    prompt: str,
+    gen_length: int = 2048,
+    overrides: Optional[Dict] = None,
+    stats_out: Optional[List] = None,
+) -> Tuple[str, int]:
+    """CANDLE-G：CANDLE + local score + two-level gate + right-only propagation。"""
+    ov = overrides or {}
+    candle_g_config = CandleGConfig(
+        top_v=ov.get("top_v", 4),
+        num_lookahead=ov.get("num_lookahead", 2),
+        consistency_weight=ov.get("consistency_weight", 0.5),
+        entropy_weight=ov.get("entropy_weight", 0.2),
+        lookahead_warmup=ov.get("lookahead_warmup", 3),
+        accept_threshold2=ov.get("accept_threshold2", 0.90),
+        use_local_leap=ov.get("use_local_leap", True),
+        local_radius=ov.get("local_radius", 2),
+        local_relaxed_threshold=ov.get("local_relaxed_threshold", 0.78),
+        max_local_accept=ov.get("max_local_accept", 2),
+        anchor_score_threshold=ov.get("anchor_score_threshold", 0.0),
+        local_consistency_floor=ov.get("local_consistency_floor", 0.55),
+        local_entropy_floor=ov.get("local_entropy_floor", -0.02),
+        gen_length=gen_length,
+        block_length=32,
+        threshold=0.7,
+        editing_threshold=0.5,
+        temperature=0.0,
+        max_post_steps=16,
+        eos_early_stop=True,
+        eos_id=156892,
+        mask_id=156895,
+    )
+    return generate_with_candle_g(
+        model, tokenizer, prompt, candle_g_config, stats_out=stats_out
+    )
+
+
 # ---------------------------------------------------------------------------
 # 5. 针对不同 benchmark 的适配
 # ---------------------------------------------------------------------------
@@ -688,8 +740,17 @@ def main():
         "--decode_mode",
         type=str,
         default="baseline",
-        choices=["baseline", "lopa", "ccd", "clad", "clad_v2", "candle", "clad_v3"],
-        help="解码策略：baseline / lopa / ccd / clad(v1) / clad_v2(O1+O2) / candle(anchor+local leap) / clad_v3(O1+O2+O3+O4)",
+        choices=[
+            "baseline",
+            "lopa",
+            "ccd",
+            "clad",
+            "clad_v2",
+            "candle",
+            "candle_g",
+            "clad_v3",
+        ],
+        help="解码策略：baseline / lopa / ccd / clad(v1) / clad_v2(O1+O2) / candle(anchor+local leap) / candle_g(gated local propagation) / clad_v3(O1+O2+O3+O4)",
     )
     parser.add_argument(
         "--max_examples",
@@ -829,7 +890,12 @@ def main():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         # 若有超参数覆盖，在文件名中追加 tag，便于区分消融实验结果
         _ov_tag = ""
-        if clad_overrides and args.decode_mode in ("clad", "clad_v2", "candle"):
+        if clad_overrides and args.decode_mode in (
+            "clad",
+            "clad_v2",
+            "candle",
+            "candle_g",
+        ):
             parts = []
             if "num_lookahead" in clad_overrides:
                 parts.append(f"k{clad_overrides['num_lookahead']}")
@@ -845,7 +911,7 @@ def main():
                 parts.append(
                     f"t2{clad_overrides['accept_threshold2']:.2f}".replace(".", "")
                 )
-            if args.decode_mode == "candle":
+            if args.decode_mode in ("candle", "candle_g"):
                 if "local_radius" in clad_overrides:
                     parts.append(f"r{clad_overrides['local_radius']}")
                 if "local_relaxed_threshold" in clad_overrides:
@@ -992,7 +1058,7 @@ def main():
                 clad_overrides=clad_overrides if clad_overrides else None,
                 stats_out=(
                     _sample_stats
-                    if args.decode_mode in ("clad", "clad_v2", "candle")
+                    if args.decode_mode in ("clad", "clad_v2", "candle", "candle_g")
                     else None
                 ),
             )
