@@ -43,6 +43,9 @@ from llada_candle_g_decode import generate_with_candle_g, CandleGConfig
 # CALM（Consistency-Anchored Local March）
 from llada_calm_decode import generate_with_calm, CalmConfig
 
+# LocalLeap（纯高置信 anchor 邻域传播强 baseline）
+from llada_localleap_decode import generate_with_localleap, LocalLeapConfig
+
 
 """
 用 LLaDA2.1-mini 在本地 benchmarks 上跑不同的解码策略，并记录解码效率指标。
@@ -57,6 +60,7 @@ from llada_calm_decode import generate_with_calm, CalmConfig
 - candle: CANDLE，在 CLAD v2 anchor 选择基础上加入局部确定性传播（local leap）
 - candle_g: CANDLE-G，在 CANDLE 基础上加入 local score、双层 gate 与右侧传播优先
 - calm: CALM，在 Phase-1 一致性锚点基础上直接做局部多 token 接受，并在未命中时直接 fallback
+- localleap: LocalLeap，当前步高置信 anchor 的局部确定性传播 baseline
 
 当前支持的 benchmark 文件（均为 jsonl，一行一个样本）：
 - math:
@@ -340,6 +344,15 @@ def run_generate_single(
             overrides=ov,
             stats_out=stats_out,
         )
+    if decode_mode == "localleap":
+        return _run_localleap_generate(
+            actual_model,
+            tokenizer,
+            prompt,
+            gen_length=gen_length,
+            overrides=ov,
+            stats_out=stats_out,
+        )
     if decode_mode == "clad_v3":
         return _run_clad_v3_generate(
             actual_model, tokenizer, prompt, gen_length=gen_length
@@ -347,7 +360,7 @@ def run_generate_single(
     else:
         raise ValueError(
             f"Unsupported decode_mode: {decode_mode}. "
-            f"Supported modes: ['baseline', 'lopa', 'ccd', 'clad', 'clad_v2', 'candle', 'candle_g', 'calm', 'clad_v3']"
+            f"Supported modes: ['baseline', 'lopa', 'ccd', 'clad', 'clad_v2', 'candle', 'candle_g', 'calm', 'localleap', 'clad_v3']"
         )
 
 
@@ -636,6 +649,8 @@ def _run_calm_generate(
         top_v=ov.get("top_v", 4),
         neighbor_radius=ov.get("neighbor_radius", 1),
         max_neighbor_accept_per_anchor=ov.get("max_neighbor_accept_per_anchor", 1),
+        anchor_mode=ov.get("calm_anchor_mode", "consistency"),
+        random_anchor_seed=ov.get("calm_random_anchor_seed", 0),
         local_threshold_start=ov.get("local_threshold_start", 0.90),
         local_threshold_end=ov.get("local_threshold_end", 0.72),
         local_threshold_gamma=ov.get("local_threshold_gamma", 1.0),
@@ -651,6 +666,35 @@ def _run_calm_generate(
     )
     return generate_with_calm(
         model, tokenizer, prompt, calm_config, stats_out=stats_out
+    )
+
+
+def _run_localleap_generate(
+    model,
+    tokenizer,
+    prompt: str,
+    gen_length: int = 2048,
+    overrides: Optional[Dict] = None,
+    stats_out: Optional[List] = None,
+) -> Tuple[str, int]:
+    """LocalLeap：current-confidence anchor + relaxed local neighborhood propagation。"""
+    ov = overrides or {}
+    localleap_config = LocalLeapConfig(
+        anchor_threshold=ov.get("localleap_anchor_threshold", 0.90),
+        relaxed_threshold=ov.get("localleap_relaxed_threshold", 0.75),
+        local_radius=ov.get("localleap_radius", 4),
+        gen_length=gen_length,
+        block_length=32,
+        threshold=0.7,
+        editing_threshold=0.5,
+        temperature=0.0,
+        max_post_steps=16,
+        eos_early_stop=True,
+        eos_id=156892,
+        mask_id=156895,
+    )
+    return generate_with_localleap(
+        model, tokenizer, prompt, localleap_config, stats_out=stats_out
     )
 
 
@@ -794,15 +838,28 @@ def main():
             "candle",
             "candle_g",
             "calm",
+            "localleap",
             "clad_v3",
         ],
-        help="解码策略：baseline / lopa / ccd / clad(v1) / clad_v2(O1+O2) / candle(anchor+local leap) / candle_g(gated local propagation) / calm(consistency-anchored local acceptance) / clad_v3(O1+O2+O3+O4)",
+        help="解码策略：baseline / lopa / ccd / clad(v1) / clad_v2(O1+O2) / candle(anchor+local leap) / candle_g(gated local propagation) / calm(consistency-anchored local acceptance) / localleap(confidence-anchor local propagation) / clad_v3(O1+O2+O3+O4)",
     )
     parser.add_argument(
         "--max_examples",
         type=int,
         default=None,
         help="最多跑多少条样本（默认全部）",
+    )
+    parser.add_argument(
+        "--start_index",
+        type=int,
+        default=None,
+        help="按数据集原始顺序切片的起始下标，0-based，包含该下标",
+    )
+    parser.add_argument(
+        "--end_index",
+        type=int,
+        default=None,
+        help="按数据集原始顺序切片的结束下标，0-based，不包含该下标",
     )
     # ── CLAD 超参数覆盖（消融实验用）────────────────────────────────────────
     parser.add_argument(
@@ -916,6 +973,41 @@ def main():
         metavar="gamma",
         help="覆盖 CALM 的 local_threshold_gamma（默认 1.0）",
     )
+    parser.add_argument(
+        "--calm_anchor_mode",
+        type=str,
+        choices=["consistency", "random"],
+        default=None,
+        help="CALM anchor 消融：consistency 使用跨步一致 anchor；random 使用匹配数量的随机 anchor（默认 consistency）",
+    )
+    parser.add_argument(
+        "--calm_random_seed",
+        type=int,
+        default=None,
+        metavar="seed",
+        help="CALM random-anchor 消融的随机种子（默认 0）",
+    )
+    parser.add_argument(
+        "--localleap_anchor_threshold",
+        type=float,
+        default=None,
+        metavar="thr_anchor",
+        help="覆盖 LocalLeap 的 anchor_threshold（默认 0.90）",
+    )
+    parser.add_argument(
+        "--localleap_relaxed_threshold",
+        type=float,
+        default=None,
+        metavar="thr_relaxed",
+        help="覆盖 LocalLeap 的 relaxed_threshold（默认 0.75）",
+    )
+    parser.add_argument(
+        "--localleap_radius",
+        type=int,
+        default=None,
+        metavar="R",
+        help="覆盖 LocalLeap 的 local_radius（默认 4）",
+    )
     args = parser.parse_args()
 
     # 构建超参数覆盖字典（仅含显式传入的参数）
@@ -950,6 +1042,16 @@ def main():
         clad_overrides["local_threshold_end"] = args.calm_tau_end
     if args.calm_tau_gamma is not None:
         clad_overrides["local_threshold_gamma"] = args.calm_tau_gamma
+    if args.calm_anchor_mode is not None:
+        clad_overrides["calm_anchor_mode"] = args.calm_anchor_mode
+    if args.calm_random_seed is not None:
+        clad_overrides["calm_random_anchor_seed"] = args.calm_random_seed
+    if args.localleap_anchor_threshold is not None:
+        clad_overrides["localleap_anchor_threshold"] = args.localleap_anchor_threshold
+    if args.localleap_relaxed_threshold is not None:
+        clad_overrides["localleap_relaxed_threshold"] = args.localleap_relaxed_threshold
+    if args.localleap_radius is not None:
+        clad_overrides["localleap_radius"] = args.localleap_radius
 
     # 参数验证：必须指定 --benchmark 或 --benchmarks 中的一个
     if not args.benchmark and not args.benchmarks:
@@ -958,6 +1060,16 @@ def main():
         parser.error("不能同时指定 --benchmark 和 --benchmarks")
     if args.resume_file and args.benchmarks:
         parser.error("--resume_file 目前仅支持与单个 --benchmark 一起使用")
+    if (args.start_index is None) != (args.end_index is None):
+        parser.error("--start_index 和 --end_index 必须同时指定")
+    if args.start_index is not None:
+        if args.start_index < 0 or args.end_index <= args.start_index:
+            parser.error("--start_index/--end_index 必须满足 0 <= start < end")
+        if args.max_examples is not None:
+            parser.error("--start_index/--end_index 与 --max_examples 不能同时使用，避免切片语义混淆")
+    range_tag = ""
+    if args.start_index is not None:
+        range_tag = f"_idx{args.start_index:04d}-{args.end_index:04d}"
 
     # 确定要处理的 benchmark 列表
     if args.benchmark:
@@ -987,6 +1099,7 @@ def main():
             "candle",
             "candle_g",
             "calm",
+            "localleap",
         ):
             parts = []
             if "num_lookahead" in clad_overrides:
@@ -1015,6 +1128,10 @@ def main():
                 if "max_local_accept" in clad_overrides:
                     parts.append(f"m{clad_overrides['max_local_accept']}")
             if args.decode_mode == "calm":
+                if "calm_anchor_mode" in clad_overrides:
+                    parts.append(f"anchor_{clad_overrides['calm_anchor_mode']}")
+                if "calm_random_anchor_seed" in clad_overrides:
+                    parts.append(f"seed{clad_overrides['calm_random_anchor_seed']}")
                 if "neighbor_radius" in clad_overrides:
                     parts.append(f"r{clad_overrides['neighbor_radius']}")
                 if "max_neighbor_accept_per_anchor" in clad_overrides:
@@ -1037,6 +1154,21 @@ def main():
                             ".", ""
                         )
                     )
+            if args.decode_mode == "localleap":
+                if "localleap_radius" in clad_overrides:
+                    parts.append(f"r{clad_overrides['localleap_radius']}")
+                if "localleap_anchor_threshold" in clad_overrides:
+                    parts.append(
+                        f"ta{clad_overrides['localleap_anchor_threshold']:.2f}".replace(
+                            ".", ""
+                        )
+                    )
+                if "localleap_relaxed_threshold" in clad_overrides:
+                    parts.append(
+                        f"tr{clad_overrides['localleap_relaxed_threshold']:.2f}".replace(
+                            ".", ""
+                        )
+                    )
             if parts:
                 _ov_tag = "_" + "_".join(parts)
         if args.resume_file:
@@ -1044,9 +1176,14 @@ def main():
         else:
             out_path = (
                 RUN_ROOT
-                / f"{ts}_llada2_{benchmark_name}_decode={args.decode_mode}{_ov_tag}.jsonl"
+                / f"{ts}_llada2_{benchmark_name}_decode={args.decode_mode}{_ov_tag}{range_tag}.jsonl"
             )
         print(f"[run] 输出结果将写入: {out_path}")
+        if args.start_index is not None:
+            print(
+                f"[run] 样本切片: index in [{args.start_index}, {args.end_index}) "
+                f"（0-based，按 benchmark 原始 jsonl 顺序）"
+            )
         if clad_overrides:
             print(f"[run] CLAD 超参数覆盖: {clad_overrides}")
 
@@ -1102,7 +1239,15 @@ def main():
         # 处理当前 benchmark 的所有样本
         processed = 0
         skipped_completed = 0
-        for ex in iterator:
+        skipped_out_of_range = 0
+        for sample_index, ex in enumerate(iterator):
+            if args.start_index is not None:
+                if sample_index < args.start_index:
+                    skipped_out_of_range += 1
+                    continue
+                if sample_index >= args.end_index:
+                    break
+
             sample_id = ex.get("id")
             if sample_id in completed_ids:
                 skipped_completed += 1
@@ -1174,7 +1319,7 @@ def main():
                 stats_out=(
                     _sample_stats
                     if args.decode_mode
-                    in ("clad", "clad_v2", "candle", "candle_g", "calm")
+                    in ("clad", "clad_v2", "candle", "candle_g", "calm", "localleap")
                     else None
                 ),
             )
@@ -1202,6 +1347,7 @@ def main():
                 "id": sample_id,
                 "benchmark": benchmark_name,
                 "decode_mode": args.decode_mode,
+                "sample_index": sample_index,
                 "model_answer": gen_text,
                 # 供评测脚本使用的效率指标
                 "input_token_len": input_token_len,
@@ -1255,7 +1401,8 @@ def main():
 
         print(
             f"[{benchmark_name}] 完成，新增样本数: {processed}，"
-            f"跳过已完成样本数: {skipped_completed}，结果保存在: {out_path}"
+            f"跳过已完成样本数: {skipped_completed}，"
+            f"切片范围外跳过: {skipped_out_of_range}，结果保存在: {out_path}"
         )
         total_processed += processed
 

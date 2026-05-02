@@ -48,12 +48,15 @@ class DecodeStats:
 
     def hit_rates(self) -> dict:
         n = max(self.total_iters, 1)
+        local_tokens_per_iter = self.local_leap_tokens / n
         return {
             "phase1_hit_rate": self.phase1_iters / n,
             "phase2_trigger_rate": self.phase2_iters / n,
             "phase2_accepted_rate": self.phase2_accepted / n,
             "local_leap_hit_rate": self.local_leap_iters / n,
-            "local_leap_token_rate": self.local_leap_tokens / n,
+            # Backward-compatible name; semantically this is tokens per iteration.
+            "local_leap_token_rate": local_tokens_per_iter,
+            "local_leap_tokens_per_iter": local_tokens_per_iter,
             "o2_hit_rate": self.o2_iters / n,
             "phase3_fallback_rate": self.phase3_iters / n,
         }

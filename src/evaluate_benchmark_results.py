@@ -56,6 +56,11 @@ PHASE_RATE_KEYS = [
     "phase3_fallback_rate",
 ]
 
+TOKEN_PER_ITER_COUNT_KEYS = {
+    "calm_neighbor_token_rate": "calm_neighbor_token_count",
+    "local_leap_token_rate": "local_leap_token_count",
+}
+
 # ---------------------------------------------------------------------------
 # 0. 日志初始化（stdout/stderr tee 到文件，judge prompt/response 写入独立 judge log）
 # ---------------------------------------------------------------------------
@@ -365,6 +370,8 @@ def evaluate_results_file(
             "phase_rate_avgs": {},
             "phase_rate_sums": {k: 0.0 for k in PHASE_RATE_KEYS},
             "phase_rate_counts": {k: 0 for k in PHASE_RATE_KEYS},
+            "token_per_iter_sums": {k: 0.0 for k in TOKEN_PER_ITER_COUNT_KEYS},
+            "token_per_iter_iters": {k: 0 for k in TOKEN_PER_ITER_COUNT_KEYS},
         }
 
     # 评测每个样本（正确性相关）
@@ -402,6 +409,8 @@ def evaluate_results_file(
     count_diffusion_steps = 0
     phase_rate_sums = {k: 0.0 for k in PHASE_RATE_KEYS}
     phase_rate_counts = {k: 0 for k in PHASE_RATE_KEYS}
+    token_per_iter_sums = {k: 0.0 for k in TOKEN_PER_ITER_COUNT_KEYS}
+    token_per_iter_iters = {k: 0 for k in TOKEN_PER_ITER_COUNT_KEYS}
 
     for sample in samples:
         t = sample.get("gen_time_sec", None)
@@ -439,12 +448,20 @@ def evaluate_results_file(
             sum_diffusion_steps += ds
             count_diffusion_steps += 1
 
-        # 阶段命中率：run_benchmark_llada2.py 中已按样本写入 0~1 浮点数
+        # 阶段统计：hit/fallback 字段为 0~1 浮点数；token-rate 字段为 tokens/iter。
         for key in PHASE_RATE_KEYS:
             v = sample.get(key, None)
             if isinstance(v, (int, float)):
                 phase_rate_sums[key] += float(v)
                 phase_rate_counts[key] += 1
+
+        total_iters = sample.get("decode_total_iters", None)
+        if isinstance(total_iters, int) and total_iters > 0:
+            for rate_key, count_key in TOKEN_PER_ITER_COUNT_KEYS.items():
+                token_count = sample.get(count_key, None)
+                if isinstance(token_count, (int, float)):
+                    token_per_iter_sums[rate_key] += float(token_count)
+                    token_per_iter_iters[rate_key] += total_iters
 
     avg_gen_time = sum_gen_time / count_gen_time if count_gen_time > 0 else None
     avg_output_len = sum_output_len / count_output_len if count_output_len > 0 else None
@@ -477,6 +494,10 @@ def evaluate_results_file(
         for k in PHASE_RATE_KEYS
         if phase_rate_counts[k] > 0
     }
+    for key in TOKEN_PER_ITER_COUNT_KEYS:
+        if token_per_iter_iters[key] > 0:
+            # Prefer macro tokens/iteration when raw counts are available.
+            phase_rate_avgs[key] = token_per_iter_sums[key] / token_per_iter_iters[key]
 
     # 按 benchmark 分组统计（正确率）
     by_benchmark = {}
@@ -526,6 +547,8 @@ def evaluate_results_file(
         "phase_rate_avgs": phase_rate_avgs,
         "phase_rate_sums": phase_rate_sums,
         "phase_rate_counts": phase_rate_counts,
+        "token_per_iter_sums": token_per_iter_sums,
+        "token_per_iter_iters": token_per_iter_iters,
     }
 
 
@@ -587,6 +610,14 @@ def generate_report(
         k: sum(r.get("phase_rate_counts", {}).get(k, 0) for r in evaluation_results)
         for k in PHASE_RATE_KEYS
     }
+    total_token_per_iter_sums = {
+        k: sum(r.get("token_per_iter_sums", {}).get(k, 0.0) for r in evaluation_results)
+        for k in TOKEN_PER_ITER_COUNT_KEYS
+    }
+    total_token_per_iter_iters = {
+        k: sum(r.get("token_per_iter_iters", {}).get(k, 0) for r in evaluation_results)
+        for k in TOKEN_PER_ITER_COUNT_KEYS
+    }
     sum_avg_tpf_weighted = sum(
         r["avg_tpf"] * r["count_tpf_samples"]
         for r in evaluation_results
@@ -632,6 +663,11 @@ def generate_report(
         for k in PHASE_RATE_KEYS
         if total_phase_rate_counts[k] > 0
     }
+    for key in TOKEN_PER_ITER_COUNT_KEYS:
+        if total_token_per_iter_iters[key] > 0:
+            overall_phase_rate_avgs[key] = (
+                total_token_per_iter_sums[key] / total_token_per_iter_iters[key]
+            )
 
     report_lines.append(f"\n📊 Overall Statistics (Accuracy):")
     report_lines.append(f"  Total Samples: {total_samples}")
@@ -684,23 +720,29 @@ def generate_report(
                 "to record forward_count in jsonl)"
             )
         if overall_phase_rate_avgs:
-            report_lines.append("  Decode Phase Hit Rates:")
+            report_lines.append("  Decode Phase Statistics:")
             phase_labels = {
                 "phase1_hit_rate": "Phase-1 hit rate",
                 "calm_neighbor_hit_rate": "CALM neighbor hit rate",
-                "calm_neighbor_token_rate": "CALM neighbor token rate",
+                "calm_neighbor_token_rate": "CALM neighbor tokens/iter",
                 "phase2_trigger_rate": "Phase-2 trigger rate",
                 "phase2_accepted_rate": "Phase-2 accepted rate",
                 "local_leap_hit_rate": "Local-leap hit rate",
-                "local_leap_token_rate": "Local-leap token rate",
+                "local_leap_token_rate": "Local-leap relaxed-neighbor tokens/iter",
                 "o2_hit_rate": "O2 extra-accept rate",
                 "phase3_fallback_rate": "Phase-3 fallback rate",
             }
+            token_per_iter_keys = {
+                "calm_neighbor_token_rate",
+                "local_leap_token_rate",
+            }
             for key in PHASE_RATE_KEYS:
                 if key in overall_phase_rate_avgs:
-                    report_lines.append(
-                        f"    {phase_labels[key]}: {overall_phase_rate_avgs[key]:.1%}"
-                    )
+                    value = overall_phase_rate_avgs[key]
+                    if key in token_per_iter_keys:
+                        report_lines.append(f"    {phase_labels[key]}: {value:.2f}")
+                    else:
+                        report_lines.append(f"    {phase_labels[key]}: {value:.1%}")
 
     # 按文件统计
     report_lines.append(f"\n📁 By File:")
@@ -753,23 +795,29 @@ def generate_report(
                 )
             phase_rate_avgs = result.get("phase_rate_avgs", {})
             if phase_rate_avgs:
-                report_lines.append("      Decode Phase Hit Rates:")
+                report_lines.append("      Decode Phase Statistics:")
                 phase_labels = {
                     "phase1_hit_rate": "Phase-1 hit rate",
                     "calm_neighbor_hit_rate": "CALM neighbor hit rate",
-                    "calm_neighbor_token_rate": "CALM neighbor token rate",
+                    "calm_neighbor_token_rate": "CALM neighbor tokens/iter",
                     "phase2_trigger_rate": "Phase-2 trigger rate",
                     "phase2_accepted_rate": "Phase-2 accepted rate",
                     "local_leap_hit_rate": "Local-leap hit rate",
-                    "local_leap_token_rate": "Local-leap token rate",
+                    "local_leap_token_rate": "Local-leap relaxed-neighbor tokens/iter",
                     "o2_hit_rate": "O2 extra-accept rate",
                     "phase3_fallback_rate": "Phase-3 fallback rate",
                 }
+                token_per_iter_keys = {
+                    "calm_neighbor_token_rate",
+                    "local_leap_token_rate",
+                }
                 for key in PHASE_RATE_KEYS:
                     if key in phase_rate_avgs:
-                        report_lines.append(
-                            f"        {phase_labels[key]}: {phase_rate_avgs[key]:.1%}"
-                        )
+                        value = phase_rate_avgs[key]
+                        if key in token_per_iter_keys:
+                            report_lines.append(f"        {phase_labels[key]}: {value:.2f}")
+                        else:
+                            report_lines.append(f"        {phase_labels[key]}: {value:.1%}")
 
         # 按 benchmark 统计
         if result["by_benchmark"]:

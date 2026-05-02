@@ -18,6 +18,14 @@ def save_jsonl(records, path: Path):
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
+def _first_present(row: dict, keys, default=None):
+    """返回 row 中第一个存在且非空的字段值。"""
+    for k in keys:
+        if k in row and row[k] is not None:
+            return row[k]
+    return default
+
+
 def export_gsm8k_small(n_train: int = 200, n_test: int = 100):
     ds = load_dataset("openai/gsm8k", "main")
     recs = []
@@ -229,6 +237,99 @@ def export_math500_test():
     print(f"[MATH500] saved {len(recs)} examples to {out_path}")
 
 
+def export_gpqa(
+    subset: str = "gpqa_diamond",
+    n: int = 300,
+    seed: int = 42,
+    dataset_id: str = "Idavidrein/gpqa",
+):
+    """
+    下载 GPQA（研究生水平科学多选问答）并导出为统一的 reasoning jsonl。
+
+    说明：
+    - GPQA 常见字段名为 Question / Correct Answer / Incorrect Answer 1~3；
+    - 输出统一为多选题格式，便于复用 ARC 的评测流程：
+      id, subset, question, choices, answer_key, answer_text。
+    """
+    try:
+        ds = load_dataset(dataset_id, subset)
+    except Exception as e:
+        raise RuntimeError(
+            f"[GPQA] 加载失败: {e}\n"
+            "该数据集通常是 gated，请先在 Hugging Face 申请访问权限并完成登录。"
+        ) from e
+
+    split_name = "train" if "train" in ds else list(ds.keys())[0]
+    split = ds[split_name]
+    total = len(split)
+
+    if n is None or n <= 0 or n > total:
+        n = total
+
+    rng = random.Random(seed)
+    indices = list(range(total))
+    rng.shuffle(indices)
+    chosen = sorted(indices[:n])
+
+    recs = []
+    for idx in chosen:
+        row = split[idx]
+
+        question = _first_present(row, ["Question", "question", "prompt"], "")
+        correct = _first_present(
+            row,
+            ["Correct Answer", "correct_answer", "answer"],
+            "",
+        )
+        wrong1 = _first_present(row, ["Incorrect Answer 1", "incorrect_answer_1"], "")
+        wrong2 = _first_present(row, ["Incorrect Answer 2", "incorrect_answer_2"], "")
+        wrong3 = _first_present(row, ["Incorrect Answer 3", "incorrect_answer_3"], "")
+
+        options = [correct, wrong1, wrong2, wrong3]
+        # 过滤空值，避免脏数据导致空选项
+        options = [x for x in options if isinstance(x, str) and x.strip()]
+        if len(options) < 2:
+            # 该题无法构造成有效多选题时跳过
+            continue
+
+        rng.shuffle(options)
+        labels = ["A", "B", "C", "D", "E", "F"]
+        choices = [
+            {"label": labels[i], "text": opt}
+            for i, opt in enumerate(options)
+        ]
+
+        answer_key = next(
+            (c["label"] for c in choices if c["text"] == correct),
+            labels[0],
+        )
+        answer_text = next(
+            (c["text"] for c in choices if c["label"] == answer_key),
+            correct,
+        )
+
+        rec = {
+            "id": row.get("id") or f"{subset}_{split_name}_{idx}",
+            "subset": subset,
+            "question": question,
+            "choices": choices,
+            "answer_key": answer_key,
+            "answer_text": answer_text,
+        }
+        # 兼容保留学科元信息（如果有）
+        for k in ["Subdomain", "subdomain", "Domain", "domain"]:
+            if k in row and row[k] is not None:
+                rec[k.lower()] = row[k]
+        recs.append(rec)
+
+    out_path = OUT_DIR / "reasoning" / f"{subset}_{n}.jsonl"
+    save_jsonl(recs, out_path)
+    print(
+        f"[GPQA] {subset}: saved {len(recs)} / {total} examples "
+        f"(split={split_name}, seed={seed}) to {out_path}"
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="下载并导出 benchmark 数据集到本地 jsonl"
@@ -245,6 +346,7 @@ if __name__ == "__main__":
             "humaneval_all",
             "arc",
             "math500",
+            "gpqa",
             "all",
         ],
         help="要导出的数据集；默认 math500",
@@ -267,6 +369,30 @@ if __name__ == "__main__":
         default=42,
         help="gsm8k_test_only：随机种子，保证子集可复现（默认 42）",
     )
+    parser.add_argument(
+        "--gpqa_subset",
+        type=str,
+        default="gpqa_diamond",
+        help="GPQA 子集名（常用: gpqa_main / gpqa_diamond / gpqa_extended）",
+    )
+    parser.add_argument(
+        "--gpqa_n",
+        type=int,
+        default=300,
+        help="GPQA 导出条数；<=0 表示导出全部（默认 300）",
+    )
+    parser.add_argument(
+        "--gpqa_seed",
+        type=int,
+        default=42,
+        help="GPQA 随机种子（默认 42）",
+    )
+    parser.add_argument(
+        "--gpqa_dataset_id",
+        type=str,
+        default="Idavidrein/gpqa",
+        help="GPQA 的 Hugging Face dataset id（默认 Idavidrein/gpqa）",
+    )
     args = parser.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -285,5 +411,12 @@ if __name__ == "__main__":
         export_arc(n=args.arc_n)
     if args.dataset in ("math500", "all"):
         export_math500_test()
+    if args.dataset in ("gpqa",):
+        export_gpqa(
+            subset=args.gpqa_subset,
+            n=args.gpqa_n,
+            seed=args.gpqa_seed,
+            dataset_id=args.gpqa_dataset_id,
+        )
 
     print("Done.")

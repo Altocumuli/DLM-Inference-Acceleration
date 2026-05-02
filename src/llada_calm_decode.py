@@ -36,10 +36,15 @@ class DecodeStats:
 
     def hit_rates(self) -> dict:
         n = max(self.total_iters, 1)
+        neighbor_tokens_per_iter = self.calm_neighbor_tokens / n
         return {
             "phase1_hit_rate": self.phase1_iters / n,
             "calm_neighbor_hit_rate": self.calm_neighbor_iters / n,
-            "calm_neighbor_token_rate": self.calm_neighbor_tokens / n,
+            # Backward-compatible name; semantically this is tokens per iteration.
+            "calm_neighbor_token_rate": neighbor_tokens_per_iter,
+            "calm_neighbor_tokens_per_iter": neighbor_tokens_per_iter,
+            "calm_neighbor_token_count": self.calm_neighbor_tokens,
+            "decode_total_iters": self.total_iters,
             "phase3_fallback_rate": self.phase3_iters / n,
         }
 
@@ -51,6 +56,8 @@ class CalmConfig:
     top_v: int = 4
     neighbor_radius: int = 1
     max_neighbor_accept_per_anchor: int = 1
+    anchor_mode: str = "consistency"  # consistency | random
+    random_anchor_seed: int = 0
 
     local_threshold_start: float = 0.90
     local_threshold_end: float = 0.72
@@ -149,6 +156,26 @@ def _apply_calm_neighbor_accept(
     }
 
 
+def _select_random_matched_anchors(
+    active_mask: torch.Tensor,
+    anchor_budget: int,
+    device: torch.device,
+    seed: int,
+) -> torch.Tensor:
+    """Sample the same number of random anchors as the consistency baseline."""
+    active_positions = torch.nonzero(active_mask, as_tuple=False).view(-1)
+    if anchor_budget <= 0 or active_positions.numel() == 0:
+        return active_positions[:0]
+
+    n_select = min(int(anchor_budget), int(active_positions.numel()))
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed))
+    perm = torch.randperm(active_positions.numel(), device=device, generator=generator)
+    selected = active_positions[perm[:n_select]]
+    selected, _ = torch.sort(selected)
+    return selected
+
+
 def _calm_decode_block(
     model,
     x: torch.Tensor,
@@ -199,13 +226,45 @@ def _calm_decode_block(
                 neg_ent, tokens, active_mask
             )
             if pos is not None and len(pos) > 0:
-                anchor_positions = [int(p) for p in pos.tolist()]
-                x[0, block_start:block_end][pos] = tok
-                print(f"    [CALM] Phase-1 consistency: accepted {len(pos)} anchors")
+                consistency_positions = [int(p) for p in pos.tolist()]
+                consistency_tokens = [int(t) for t in tok.tolist()]
+                if config.anchor_mode == "consistency":
+                    anchor_pos_tensor = pos
+                    anchor_tok_tensor = tok
+                elif config.anchor_mode == "random":
+                    prompt_hash = int(
+                        torch.sum(x[0, :prompt_length].to(torch.int64)).item()
+                        % 1_000_003
+                    )
+                    random_seed = (
+                        int(config.random_anchor_seed)
+                        + prompt_hash * 9176
+                        + int(block_start) * 1_000_003
+                        + int(iter_count)
+                    )
+                    anchor_pos_tensor = _select_random_matched_anchors(
+                        active_mask,
+                        int(len(pos)),
+                        device,
+                        random_seed,
+                    )
+                    anchor_tok_tensor = tokens[anchor_pos_tensor]
+                else:
+                    raise ValueError(
+                        "CalmConfig.anchor_mode must be 'consistency' or 'random'"
+                    )
+
+                anchor_positions = [int(p) for p in anchor_pos_tensor.tolist()]
+                anchor_tokens = [int(t) for t in anchor_tok_tensor.tolist()]
+                x[0, block_start:block_end][anchor_pos_tensor] = anchor_tok_tensor
+                print(
+                    f"    [CALM] Phase-1 {config.anchor_mode}: "
+                    f"accepted {len(anchor_positions)} anchors"
+                )
                 accepted = True
                 if stats is not None:
                     stats.phase1_iters += 1
-                    stats.phase1_tokens += len(pos)
+                    stats.phase1_tokens += len(anchor_positions)
 
                 local_threshold = _annealed_local_threshold(
                     iter_count, max_iterations, config
@@ -232,14 +291,17 @@ def _calm_decode_block(
                         "block": int(block_start // config.block_length),
                         "iter": int(iter_count),
                         "phase": "phase1",
+                        "anchor_mode": config.anchor_mode,
                         "anchor_positions": anchor_positions,
-                        "anchor_tokens": [int(t) for t in tok.tolist()],
+                        "anchor_tokens": anchor_tokens,
+                        "reference_consistency_positions": consistency_positions,
+                        "reference_consistency_tokens": consistency_tokens,
                         "accepted_positions": anchor_positions
                         + neighbor_info["accepted_positions"],
-                        "accepted_tokens": [int(t) for t in tok.tolist()]
-                        + neighbor_info["accepted_tokens"],
+                        "accepted_tokens": anchor_tokens + neighbor_info["accepted_tokens"],
                         "n_tokens": int(
-                            len(pos) + len(neighbor_info["accepted_positions"])
+                            len(anchor_positions)
+                            + len(neighbor_info["accepted_positions"])
                         ),
                         "local_threshold": float(local_threshold),
                         "anchor_neighborhoods": neighbor_info["anchor_neighborhoods"],
@@ -341,6 +403,7 @@ def generate_with_calm(
     print(
         f"[CALM] top_v={config.top_v} radius={config.neighbor_radius} "
         f"max_local={config.max_neighbor_accept_per_anchor} "
+        f"anchor_mode={config.anchor_mode} random_seed={config.random_anchor_seed} "
         f"tau=({config.local_threshold_start:.2f}->{config.local_threshold_end:.2f}) "
         f"gamma={config.local_threshold_gamma:.2f}"
     )
